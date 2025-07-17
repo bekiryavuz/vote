@@ -2,7 +2,7 @@ name: Trigger Vercel Cron
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 15 * * 0-5'
   workflow_dispatch:
 
 jobs:
