@@ -1,0 +1,16 @@
+name: Trigger Vercel Cron
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-vercel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Curl scheduled endpoint
+        env:
+          ENDPOINT: ${{ vars.VERCEL_ENDPOINT }}
+        run: |
+          curl -X POST "$ENDPOINT"
