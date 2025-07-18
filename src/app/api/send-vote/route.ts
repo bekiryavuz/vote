@@ -6,13 +6,17 @@ const KV_REST_API_URL = process.env.KV_REST_API_URL!;
 const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN!;
 
 export async function POST(req: NextRequest) {
-    // Only post for Sunday-Thursday (cron handles this)
+    // Only post for Sunday-Friday (block Saturday)
     const now = new Date();
-    if (now.getDay() === 5 || now.getDay() === 6) { // Friday or Saturday
+    if (now.getDay() === 6) { // Saturday
         return NextResponse.json({ ok: false, info: 'Not a valid day to post vote' });
     }
     const next = new Date();
-    next.setDate(next.getDate() + 1);
+    if (now.getDay() === 5) { // Friday
+        next.setDate(next.getDate() + 3); // Next workday is Monday
+    } else {
+        next.setDate(next.getDate() + 1); // Next day
+    }
     const dateStr = next.toLocaleDateString('en-GB', { weekday: 'long', day: '2-digit', month: '2-digit' });
     const question = `Where will you be working on ${dateStr}?`;
     const options = [
