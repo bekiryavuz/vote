@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
     const next = new Date();
     next.setDate(next.getDate() + 1);
     const dateStr = next.toLocaleDateString('en-GB', { weekday: 'long', day: '2-digit', month: '2-digit' });
-    const question = `Where will you work on ${dateStr}?`;
+    const question = `Where will you be working on ${dateStr}?`;
     const options = [
         { emoji: ':house_with_garden:', label: 'HOME' },
         { emoji: ':office:', label: 'OFFICE' }
