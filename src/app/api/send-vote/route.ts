@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { randomUUID } from 'node:crypto';
+import { buildPollTally, buildSlackBlocks, PollMeta } from '@/lib/poll';
+import { kvSet } from '@/lib/kv';
+import { getTeamsConversationReference, getTeamsRefKey, sendTeamsPoll, teamsBotConfigReady } from '@/lib/teams';
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
 const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID!;
-const KV_REST_API_URL = process.env.KV_REST_API_URL!;
-const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN!;
 
 export async function POST(req: NextRequest) {
     // Only post for Sunday-Friday (block Saturday)
@@ -24,40 +26,12 @@ export async function POST(req: NextRequest) {
         { emoji: ':office:', label: 'OFFICE' }
     ];
     const creator = 'system';
+    const pollId = randomUUID();
+    const meta: PollMeta = { question, options, creator };
+    const tally = buildPollTally(options.length, []);
+    const blocks = buildSlackBlocks(meta, tally);
 
-    // Build megavote-style blocks
-    const blocks = [
-        {
-            type: 'section',
-            text: { type: 'mrkdwn', text: `*${question}*` },
-        },
-        ...options.map((opt, i) => ({
-            type: 'section',
-            text: {
-                type: 'mrkdwn',
-                text: `${i + 1}-${opt.label} ${opt.emoji}\n░░░░░░░░░░ 0% (0)\n_No votes_`,
-            },
-            accessory: {
-                type: 'button',
-                text: { type: 'plain_text', text: `Vote #${i + 1}` },
-                value: `option_${i}`,
-                action_id: `vote_option_${i}`,
-            },
-        })),
-        {
-            type: 'context',
-            elements: [
-                { type: 'mrkdwn', text: `Results: Show in Realtime | :lock: Public: Show Voter Name and Choices` },
-            ],
-        },
-        {
-            type: 'context',
-            elements: [
-                { type: 'mrkdwn', text: `OPEN by system | Responses: -- | Started: <!date^${Math.floor(Date.now() / 1000)}^{date_short} at {time}|Now>` },
-            ],
-        },
-    ];
-    // Post the poll to the channel
+    // Post the poll to the Slack channel
     const slackRes = await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST',
         headers: {
@@ -71,16 +45,37 @@ export async function POST(req: NextRequest) {
         }),
     });
     const data = await slackRes.json();
-    // Store poll metadata in KV for voting
-    if (data.ok) {
-        await fetch(`${KV_REST_API_URL}/set/poll:${data.ts}:meta`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-            body: JSON.stringify({ question, options, channel: SLACK_CHANNEL_ID, creator }),
-        });
-    }
     if (!data.ok) {
         return NextResponse.json({ error: data.error }, { status: 500 });
     }
-    return NextResponse.json({ ok: true, ts: data.ts });
+    await kvSet(`poll:${pollId}:meta`, meta);
+    await kvSet(`poll:${pollId}:slack_ts`, data.ts);
+    await kvSet(`poll:${pollId}:slack_channel_id`, SLACK_CHANNEL_ID);
+    await kvSet(`poll:slack_ts:${data.ts}`, pollId);
+
+    let teamsActivityId: string | null = null;
+    let teamsError: string | null = null;
+    if (teamsBotConfigReady()) {
+        try {
+            const reference = await getTeamsConversationReference();
+            if (!reference) {
+                teamsError = 'Teams conversation reference missing';
+            } else {
+                const refKey = getTeamsRefKey();
+                if (refKey) {
+                    await kvSet(`poll:${pollId}:teams_ref_key`, refKey);
+                }
+                teamsActivityId = await sendTeamsPoll(pollId, meta, tally, reference);
+                if (teamsActivityId) {
+                    await kvSet(`poll:${pollId}:teams_activity_id`, teamsActivityId);
+                } else {
+                    teamsError = 'Teams activity id missing';
+                }
+            }
+        } catch (error) {
+            teamsError = 'Teams send failed';
+        }
+    }
+
+    return NextResponse.json({ ok: true, poll_id: pollId, slack_ts: data.ts, teams_activity_id: teamsActivityId, teams_error: teamsError });
 } 

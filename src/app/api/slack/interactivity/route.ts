@@ -1,38 +1,80 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
+import { randomUUID } from 'node:crypto';
+import { buildPollTally, buildSlackBlocks, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
+import { kvDelete, kvGetJson, kvGetRaw, kvListKeys, kvSet } from '@/lib/kv';
+import { getTeamsConversationReference, updateTeamsPoll, teamsBotConfigReady } from '@/lib/teams';
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
-const KV_REST_API_URL = process.env.KV_REST_API_URL!;
-const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN!;
 
-// Helper function to render a poll option (for both initial and update)
-function renderPollOption({
-    index,
-    label,
-    emoji,
-    bar,
-    mentions,
-    hasVotes
-}: {
-    index: number,
-    label: string,
-    emoji: string,
-    bar: string,
-    mentions?: string,
-    hasVotes?: boolean
-}) {
-    return {
-        type: 'section',
-        text: {
-            type: 'mrkdwn',
-            text: `*${index}-${label} ${emoji}*\n${bar}` + (mentions ? `\n${mentions}` : '\n_No votes_'),
-        },
-        accessory: {
-            type: 'button',
-            text: { type: 'plain_text', text: `Vote #${index}` },
-            value: `option_${index - 1}`,
-            action_id: `vote_option_${index - 1}`
+function pollVoteKey(pollId: string, voterKey: string) {
+    return `poll:${pollId}:vote:${voterKey}`;
+}
+
+function slackVoterKey(userId: string) {
+    return `slack:${userId}`;
+}
+
+async function getPollIdBySlackTs(ts: string) {
+    const raw = await kvGetRaw(`poll:slack_ts:${ts}`);
+    return typeof raw === 'string' && raw.length > 0 ? raw : null;
+}
+
+async function getPollMeta(pollId: string): Promise<PollMeta | null> {
+    const raw = await kvGetJson<any>(`poll:${pollId}:meta`);
+    return normalizeLegacyMeta(raw);
+}
+
+async function getSlackTsForPoll(pollId: string) {
+    const raw = await kvGetRaw(`poll:${pollId}:slack_ts`);
+    return typeof raw === 'string' ? raw : null;
+}
+
+async function listVotes(pollId: string) {
+    const keys = await kvListKeys(`poll:${pollId}:vote:*`);
+    const votes: Array<{ voter?: string; optionIdx: number }> = [];
+    const prefix = `poll:${pollId}:vote:`;
+    for (const key of keys) {
+        const raw = await kvGetRaw(key);
+        const idx = parseInt(String(raw), 10);
+        if (Number.isNaN(idx)) {
+            continue;
         }
-    };
+        const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+        const voter = voterKey.startsWith('teams:')
+            ? null
+            : voterKey.startsWith('slack:')
+                ? voterKey.replace('slack:', '')
+                : voterKey;
+        votes.push({ voter: voter || undefined, optionIdx: idx });
+    }
+    return votes;
+}
+
+async function updateSlackAndTeams(pollId: string, meta: PollMeta, slackChannelId: string, slackTs: string) {
+    const votes = await listVotes(pollId);
+    const tally = buildPollTally(meta.options.length, votes);
+    const blocks = buildSlackBlocks(meta, tally);
+    await fetch('https://slack.com/api/chat.update', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${SLACK_BOT_TOKEN}`
+        },
+        body: JSON.stringify({
+            channel: slackChannelId,
+            ts: slackTs,
+            blocks
+        })
+    });
+
+    if (teamsBotConfigReady()) {
+        const teamsActivityId = await kvGetRaw(`poll:${pollId}:teams_activity_id`);
+        const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
+        const reference = teamsRefKey ? await kvGetRaw(String(teamsRefKey)) : await getTeamsConversationReference();
+        if (typeof teamsActivityId === 'string' && reference) {
+            await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId);
+        }
+    }
 }
 
 export async function POST(req: NextRequest) {
@@ -48,42 +90,18 @@ export async function POST(req: NextRequest) {
         const userId = payload.user.id;
         const channelId = payload.view.private_metadata;
 
-        // Build megavote-style blocks
-        const blocks = [
-            {
-                type: 'section',
-                text: { type: 'mrkdwn', text: `*${question}*` },
-            },
-            ...options.map((opt: string, i: number) => {
-                // For both initial and update logic, use 10 blocks for the bar
-                const barLength = 10;
-                const bar = '░'.repeat(barLength) + ' 0% (0)';
-                return [
-                    renderPollOption({
-                        index: i + 1,
-                        label: opt.toUpperCase(),
-                        emoji: opt === 'HOME' ? ':house_with_garden:' : ':office:',
-                        bar,
-                        mentions: undefined,
-                        hasVotes: false
-                    }),
-                    { type: 'section', text: { type: 'plain_text', text: ' ' } },
-                    { type: 'section', text: { type: 'plain_text', text: ' ' } }
-                ];
-            }).flat(),
-            {
-                type: 'context',
-                elements: [
-                    { type: 'mrkdwn', text: `Results: Show in Realtime | :lock: Public: Show Voter Name and Choices` },
-                ],
-            },
-            {
-                type: 'context',
-                elements: [
-                    { type: 'mrkdwn', text: `OPEN by system | Responses: -- | Started: <!date^${Math.floor(Date.now() / 1000)}^{date_short} at {time}|Now>` },
-                ],
-            },
-        ];
+        const pollId = randomUUID();
+        const meta: PollMeta = {
+            question,
+            options: options.map((opt: string) => {
+                const label = opt.toUpperCase();
+                const emoji = label === 'HOME' ? ':house_with_garden:' : label === 'OFFICE' ? ':office:' : ':grey_question:';
+                return { label, emoji };
+            }),
+            creator: userId
+        };
+        const tally = buildPollTally(meta.options.length, []);
+        const blocks = buildSlackBlocks(meta, tally);
 
         // Post the poll to the channel
         const postRes = await fetch('https://slack.com/api/chat.postMessage', {
@@ -101,11 +119,12 @@ export async function POST(req: NextRequest) {
         const postData = await postRes.json();
         // Store poll metadata in KV for later updates
         if (postData.ok) {
-            await fetch(`${KV_REST_API_URL}/set/poll:${postData.ts}:meta`, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                body: JSON.stringify({ question, options, channel: channelId, creator: userId }),
-            });
+            await kvSet(`poll:${pollId}:meta`, meta);
+            await kvSet(`poll:${pollId}:slack_ts`, postData.ts);
+            if (channelId) {
+                await kvSet(`poll:${pollId}:slack_channel_id`, channelId);
+            }
+            await kvSet(`poll:slack_ts:${postData.ts}`, pollId);
         }
         // Respond with 200 OK and empty body
         return new Response('', { status: 200 });
@@ -114,169 +133,46 @@ export async function POST(req: NextRequest) {
     // Handle voting button clicks (block actions)
     if (payload.type === 'block_actions') {
         try {
-            // Get poll info
             const action = payload.actions[0];
             const userId = payload.user.id;
             const optionIdx = parseInt(action.value.replace('option_', ''));
             const ts = payload.message.ts;
             const channelId = payload.channel.id;
-            // Get poll metadata
-            const metaRes = await fetch(`${KV_REST_API_URL}/get/poll:${ts}:meta`, {
-                headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-            });
-            const metaText = await metaRes.text();
-            let meta;
-            try {
-                meta = JSON.parse(metaText);
-                if (meta && typeof meta.result === 'string') {
-                    meta = JSON.parse(meta.result);
-                }
-            } catch {
-                console.error('Failed to parse poll metadata:', metaText);
+            const pollId = (await getPollIdBySlackTs(ts)) || ts;
+            const meta = await getPollMeta(pollId);
+            if (!meta) {
+                console.error('Poll metadata missing or malformed for poll:', pollId);
                 return new Response('', { status: 200 });
             }
-            if (!meta || !Array.isArray(meta.options)) {
-                console.error('Poll metadata missing or malformed:', meta);
-                return new Response('', { status: 200 });
-            }
-            // Check if user is toggling their vote
-            const userVoteKey = `poll:${ts}:vote:${userId}`;
-            let currentVoteVal = null;
-            try {
-                const currentVoteRes = await fetch(`${KV_REST_API_URL}/get/${userVoteKey}`, {
-                    headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                });
-                const currentVoteText = await currentVoteRes.text();
-                try {
-                    const parsed = JSON.parse(currentVoteText);
-                    currentVoteVal = parseInt(parsed.result);
-                } catch {
-                    currentVoteVal = parseInt(currentVoteText);
-                }
-            } catch { }
-            if (currentVoteVal === optionIdx) {
-                // User clicked their current vote, remove it
-                await fetch(`${KV_REST_API_URL}/del/${userVoteKey}`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                });
-                console.log('Vote removed:', userVoteKey);
-            } else {
-                // Store the user's vote
-                await fetch(`${KV_REST_API_URL}/set/${userVoteKey}`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                    body: String(optionIdx),
-                });
-                console.log('Vote written:', `${userVoteKey} = ${optionIdx}`);
-            }
-            // Get all votes
-            const votesRes = await fetch(`${KV_REST_API_URL}/keys/poll:${ts}:vote:*`, {
-                headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-            });
-            let voteKeys = [];
-            try {
-                voteKeys = await votesRes.json();
-                if (voteKeys && Array.isArray(voteKeys.result)) {
-                    voteKeys = voteKeys.result;
-                }
-                console.log('Vote keys found:', voteKeys);
-            } catch { }
-            // Tally votes
-            const counts: number[] = Array(meta.options.length).fill(0);
-            const voters: string[][] = Array(meta.options.length).fill(0).map(() => []);
-            for (const key of voteKeys) {
-                const uid = key.split(':').pop();
-                const vRes = await fetch(`${KV_REST_API_URL}/get/${key}`, {
-                    headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                });
-                const val = await vRes.text();
-                console.log('Vote value for', key, '=', val);
-                let idx;
-                try {
-                    const parsed = JSON.parse(val);
-                    idx = parseInt(parsed.result);
-                } catch {
-                    idx = parseInt(val);
-                }
-                if (!isNaN(idx) && idx >= 0 && idx < meta.options.length) {
-                    counts[idx]++;
-                    voters[idx].push(uid);
-                }
-            }
-            const totalVotes = counts.reduce((a, b) => a + b, 0);
-            // Build updated blocks
-            const blocks = [
-                {
-                    type: 'section',
-                    text: { type: 'mrkdwn', text: `*${meta.question}*` },
-                },
-                ...meta.options.map((opt: { label?: string; emoji?: string } | string, i: number) => {
-                    let label = '', emoji = '';
-                    if (typeof opt === 'object' && opt !== null && 'label' in opt && 'emoji' in opt) {
-                        label = opt.label!;
-                        emoji = opt.emoji!;
-                    } else if (typeof opt === 'string') {
-                        // fallback for old polls
-                        label = opt.toUpperCase();
-                        emoji = opt === 'HOME' ? ':house_with_garden:' : ':office:';
-                    }
-                    // For initial state, use bar as ░░░░░░░░░░ 0% (0) and _No votes_
-                    const percent = totalVotes === 0 ? 0 : Math.round((counts[i] / totalVotes) * 100);
-                    // In update logic:
-                    const barLength = 10;
-                    const filled = Math.round(percent / (100 / barLength));
-                    const bar = percent === 0 ? '░'.repeat(barLength) + ' 0% (0)' : `${'▓'.repeat(filled)}${'░'.repeat(barLength - filled)} ${percent}% (${counts[i]})`;
-                    const mentions = voters[i].map(uid => `<@${uid}>`).join(' ');
-                    return {
-                        type: 'section',
-                        text: {
-                            type: 'mrkdwn',
-                            text: `${i + 1}-${label} ${emoji}\n${bar}\n${mentions || '_No votes_'}`,
-                        },
-                        accessory: {
-                            type: 'button',
-                            text: { type: 'plain_text', text: `Vote #${i + 1}` },
-                            value: `option_${i}`,
-                            action_id: `vote_option_${i}`,
-                        },
-                    };
-                }),
-                {
-                    type: 'context',
-                    elements: [
-                        { type: 'mrkdwn', text: `Results: Show in Realtime | :lock: Public: Show Voter Name and Choices` },
-                    ],
-                },
-                {
-                    type: 'context',
-                    elements: [
-                        { type: 'mrkdwn', text: `OPEN by system | Responses: ${totalVotes} | Started: <!date^${Math.floor(Date.now() / 1000)}^{date_short} at {time}|Now>` },
-                    ],
-                },
-            ];
 
-            // Update the original message
-            const updateRes = await fetch(`https://slack.com/api/chat.update`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-                },
-                body: JSON.stringify({
-                    channel: channelId,
-                    ts: payload.message.ts,
-                    blocks,
-                }),
-            });
-            const updateData = await updateRes.json();
-            if (updateData.ok) {
-                console.log('Poll updated successfully');
-                return new Response('', { status: 200 });
-            } else {
-                console.error('Failed to update poll:', updateData.error);
-                return new Response('', { status: 500 });
+            const prefixedKey = pollVoteKey(pollId, slackVoterKey(userId));
+            const legacyKey = pollVoteKey(pollId, userId);
+            const prefixedVal = await kvGetRaw(prefixedKey);
+            const legacyVal = await kvGetRaw(legacyKey);
+            const prefixedIdx = parseInt(String(prefixedVal), 10);
+            const legacyIdx = parseInt(String(legacyVal), 10);
+            let currentKey: string | null = null;
+            let currentIdx: number | null = null;
+            if (!Number.isNaN(prefixedIdx)) {
+                currentKey = prefixedKey;
+                currentIdx = prefixedIdx;
+            } else if (!Number.isNaN(legacyIdx)) {
+                currentKey = legacyKey;
+                currentIdx = legacyIdx;
             }
+
+            if (currentKey && currentIdx === optionIdx) {
+                await kvDelete(currentKey);
+            } else {
+                if (currentKey === legacyKey) {
+                    await kvDelete(legacyKey);
+                }
+                await kvSet(prefixedKey, String(optionIdx));
+            }
+
+            const slackTs = (await getSlackTsForPoll(pollId)) || ts;
+            await updateSlackAndTeams(pollId, meta, channelId, slackTs);
+            return new Response('', { status: 200 });
         } catch (error) {
             console.error('Error handling block action:', error);
             return new Response('', { status: 500 });
@@ -287,138 +183,19 @@ export async function POST(req: NextRequest) {
     if (payload.type === 'interactive_message') {
         try {
             const action = payload.actions[0];
-            const userId = payload.user.id;
             const ts = payload.message.ts;
             const channelId = payload.channel.id;
 
             if (action.value === 'show_results') {
-                // Get poll metadata
-                const metaRes = await fetch(`${KV_REST_API_URL}/get/poll:${ts}:meta`, {
-                    headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                });
-                const metaText = await metaRes.text();
-                let meta;
-                try {
-                    meta = JSON.parse(metaText);
-                    if (meta && typeof meta.result === 'string') {
-                        meta = JSON.parse(meta.result);
-                    }
-                } catch {
-                    console.error('Failed to parse poll metadata for results:', metaText);
+                const pollId = (await getPollIdBySlackTs(ts)) || ts;
+                const meta = await getPollMeta(pollId);
+                if (!meta) {
+                    console.error('Poll metadata missing or malformed for results:', pollId);
                     return new Response('', { status: 200 });
                 }
-                if (!meta || !Array.isArray(meta.options)) {
-                    console.error('Poll metadata missing or malformed for results:', meta);
-                    return new Response('', { status: 200 });
-                }
-
-                // Get all votes
-                const votesRes = await fetch(`${KV_REST_API_URL}/keys/poll:${ts}:vote:*`, {
-                    headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                });
-                let voteKeys = [];
-                try {
-                    voteKeys = await votesRes.json();
-                    if (voteKeys && Array.isArray(voteKeys.result)) {
-                        voteKeys = voteKeys.result;
-                    }
-                    console.log('Vote keys found for results:', voteKeys);
-                } catch { }
-
-                // Tally votes
-                const counts: number[] = Array(meta.options.length).fill(0);
-                const voters: string[][] = Array(meta.options.length).fill(0).map(() => []);
-                for (const key of voteKeys) {
-                    const uid = key.split(':').pop();
-                    const vRes = await fetch(`${KV_REST_API_URL}/get/${key}`, {
-                        headers: { 'Authorization': `Bearer ${KV_REST_API_TOKEN}` },
-                    });
-                    const val = await vRes.text();
-                    console.log('Vote value for', key, '=', val);
-                    let idx;
-                    try {
-                        const parsed = JSON.parse(val);
-                        idx = parseInt(parsed.result);
-                    } catch {
-                        idx = parseInt(val);
-                    }
-                    if (!isNaN(idx) && idx >= 0 && idx < meta.options.length) {
-                        counts[idx]++;
-                        voters[idx].push(uid);
-                    }
-                }
-                const totalVotes = counts.reduce((a, b) => a + b, 0);
-
-                // Build results blocks
-                const resultsBlocks = [
-                    {
-                        type: 'section',
-                        text: { type: 'mrkdwn', text: `*${meta.question}*` },
-                    },
-                    ...meta.options.map((opt: { label?: string; emoji?: string } | string, i: number) => {
-                        let label = '', emoji = '';
-                        if (typeof opt === 'object' && opt !== null && 'label' in opt && 'emoji' in opt) {
-                            label = opt.label!;
-                            emoji = opt.emoji!;
-                        } else if (typeof opt === 'string') {
-                            // fallback for old polls
-                            label = opt.toUpperCase();
-                            emoji = opt === 'HOME' ? ':house_with_garden:' : ':office:';
-                        }
-                        const percent = totalVotes === 0 ? 0 : Math.round((counts[i] / totalVotes) * 100);
-                        const barLength = 10;
-                        const filled = Math.round(percent / (100 / barLength));
-                        const bar = percent === 0 ? '░'.repeat(barLength) + ' 0% (0)' : `${'🟩'.repeat(filled)}${'░'.repeat(barLength - filled)} ${percent}% (${counts[i]})`;
-                        const mentions = voters[i].map(uid => `<@${uid}>`).join(' ');
-                        return {
-                            type: 'section',
-                            text: {
-                                type: 'mrkdwn',
-                                text: `${i + 1}-${label} ${emoji}\n${bar}\n${mentions || '_No votes_'}`,
-                            },
-                            accessory: {
-                                type: 'button',
-                                text: { type: 'plain_text', text: `Vote #${i + 1}` },
-                                value: `option_${i}`,
-                                action_id: `vote_option_${i}`,
-                            },
-                        };
-                    }),
-                    {
-                        type: 'context',
-                        elements: [
-                            { type: 'mrkdwn', text: `Results: Show in Realtime | :lock: Public: Show Voter Name and Choices` },
-                        ],
-                    },
-                    {
-                        type: 'context',
-                        elements: [
-                            { type: 'mrkdwn', text: `OPEN by system | Responses: ${totalVotes} | Started: <!date^${Math.floor(Date.now() / 1000)}^{date_short} at {time}|Now>` },
-                        ],
-                    },
-                ];
-
-                // Update the original message with results
-                const updateRes = await fetch(`https://slack.com/api/chat.update`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-                    },
-                    body: JSON.stringify({
-                        channel: channelId,
-                        ts: payload.message.ts,
-                        blocks: resultsBlocks,
-                    }),
-                });
-                const updateData = await updateRes.json();
-                if (updateData.ok) {
-                    console.log('Poll results updated successfully');
-                    return new Response('', { status: 200 });
-                } else {
-                    console.error('Failed to update poll results:', updateData.error);
-                    return new Response('', { status: 500 });
-                }
+                const slackTs = (await getSlackTsForPoll(pollId)) || ts;
+                await updateSlackAndTeams(pollId, meta, channelId, slackTs);
+                return new Response('', { status: 200 });
             }
             return new Response('', { status: 200 }); // No specific action handled
         } catch (error) {
