@@ -20,7 +20,7 @@ async function getPollIdBySlackTs(ts: string) {
 }
 
 async function getPollMeta(pollId: string): Promise<PollMeta | null> {
-    const raw = await kvGetJson<any>(`poll:${pollId}:meta`);
+    const raw = await kvGetJson<unknown>(`poll:${pollId}:meta`);
     return normalizeLegacyMeta(raw);
 }
 

@@ -7,7 +7,7 @@ import { getTeamsConversationReference, getTeamsRefKey, sendTeamsPoll, teamsBotC
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
 const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID!;
 
-export async function POST(req: NextRequest) {
+export async function POST() {
     // Only post for Sunday-Friday (block Saturday)
     const now = new Date();
     if (now.getDay() === 6) { // Saturday
@@ -72,7 +72,7 @@ export async function POST(req: NextRequest) {
                     teamsError = 'Teams activity id missing';
                 }
             }
-        } catch (error) {
+        } catch {
             teamsError = 'Teams send failed';
         }
     }

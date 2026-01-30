@@ -21,7 +21,7 @@ async function getVotesWithUsers(ts: string) {
     let keys;
     try {
         keys = await res.json();
-    } catch (e) {
+    } catch {
         keys = [];
     }
     if (!Array.isArray(keys)) {
@@ -55,7 +55,7 @@ export async function POST(req: NextRequest) {
         let form: FormData;
         try {
             form = await req.formData();
-        } catch (e) {
+        } catch {
             return NextResponse.json({ ok: true, info: 'No form data, health check or verification' });
         }
         const payloadRaw = form.get('payload');
@@ -65,7 +65,7 @@ export async function POST(req: NextRequest) {
         let payload;
         try {
             payload = JSON.parse(payloadRaw as string);
-        } catch (e) {
+        } catch {
             return NextResponse.json({ ok: false, error: 'Invalid payload JSON' }, { status: 400 });
         }
         const { user, actions, message } = payload;
@@ -82,15 +82,6 @@ export async function POST(req: NextRequest) {
         const officeNames = await Promise.all(votes.office.map(getSlackDisplayName));
 
         // Calculate vote stats
-        const totalVotes = homeNames.length + officeNames.length;
-        function getPercent(count: number) {
-            return totalVotes === 0 ? 0 : Math.round((count / totalVotes) * 100);
-        }
-        function getBar(percent: number) {
-            // 10 blocks, filled with █, empty with ░
-            const filled = Math.round(percent / 10);
-            return '█'.repeat(filled) + '░'.repeat(10 - filled);
-        }
         // Build Slack mentions
         const homeMentions = votes.home.map(id => `<@${id}>`).join(' ');
         const officeMentions = votes.office.map(id => `<@${id}>`).join(' ');

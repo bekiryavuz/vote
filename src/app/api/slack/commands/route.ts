@@ -7,7 +7,6 @@ export async function POST(req: NextRequest) {
     const body = await req.text();
     const params = new URLSearchParams(body);
     const trigger_id = params.get('trigger_id');
-    const user_id = params.get('user_id');
     const channel_id = params.get('channel_id');
 
     if (!trigger_id) {

@@ -106,24 +106,35 @@ export function buildTeamsCard(meta: PollMeta, tally: PollTally, pollId: string)
     };
 }
 
-export function normalizeLegacyMeta(meta: any): PollMeta | null {
+type LegacyOption = { label?: unknown; emoji?: unknown };
+type LegacyMeta = { question?: unknown; options?: unknown; creator?: unknown };
+
+function parseLegacyOption(opt: unknown): PollOption | null {
+    if (typeof opt === 'string') {
+        return { label: opt.toUpperCase(), emoji: opt === 'HOME' ? ':house_with_garden:' : ':office:' };
+    }
+    if (opt && typeof opt === 'object') {
+        const record = opt as LegacyOption;
+        const label = typeof record.label === 'string' ? record.label : '';
+        const emoji = typeof record.emoji === 'string' ? record.emoji : ':question:';
+        return { label: label.toUpperCase(), emoji };
+    }
+    return null;
+}
+
+export function normalizeLegacyMeta(meta: unknown): PollMeta | null {
     if (!meta || typeof meta !== 'object') {
         return null;
     }
-    if (Array.isArray(meta.options)) {
-        const options = meta.options.map((opt: any) => {
-            if (typeof opt === 'string') {
-                return { label: opt.toUpperCase(), emoji: opt === 'HOME' ? ':house_with_garden:' : ':office:' };
-            }
-            return {
-                label: String(opt.label || '').toUpperCase(),
-                emoji: opt.emoji || ':question:'
-            };
-        });
+    const record = meta as LegacyMeta;
+    if (Array.isArray(record.options)) {
+        const options = record.options
+            .map(parseLegacyOption)
+            .filter((opt): opt is PollOption => Boolean(opt));
         return {
-            question: meta.question || '',
+            question: typeof record.question === 'string' ? record.question : '',
             options,
-            creator: meta.creator || 'system'
+            creator: typeof record.creator === 'string' ? record.creator : 'system'
         };
     }
     return null;

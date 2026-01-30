@@ -1,4 +1,4 @@
-import { TurnContext } from 'botbuilder';
+import { TurnContext, ConversationReference } from 'botbuilder';
 import { kvGetJson, kvSet } from '@/lib/kv';
 import { buildTeamsCard, PollMeta, PollTally } from '@/lib/poll';
 import { adapter, botAppId } from '@/lib/teamsAdapter';
@@ -25,11 +25,16 @@ export async function getTeamsConversationReference(teamId = TEAMS_TEAM_ID, chan
     if (!key) {
         return null;
     }
-    return kvGetJson<any>(key);
+    return kvGetJson<ConversationReference>(key);
 }
 
+type TeamsChannelData = {
+    team?: { id?: string };
+    channel?: { id?: string };
+};
+
 export async function storeConversationReference(context: TurnContext) {
-    const channelData = context.activity.channelData as any;
+    const channelData = context.activity.channelData as TeamsChannelData | undefined;
     const teamId = channelData?.team?.id;
     const channelId = channelData?.channel?.id;
     if (!teamId || !channelId) {
@@ -44,7 +49,7 @@ export async function storeConversationReference(context: TurnContext) {
     return key;
 }
 
-export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, reference: any) {
+export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, reference: ConversationReference) {
     if (!reference) {
         return null;
     }
@@ -66,7 +71,7 @@ export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollT
     return activityId;
 }
 
-export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, reference: any, activityId: string) {
+export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, reference: ConversationReference, activityId: string) {
     if (!reference || !activityId) {
         return;
     }

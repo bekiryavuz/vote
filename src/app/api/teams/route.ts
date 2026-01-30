@@ -1,4 +1,5 @@
 import { TurnContext } from 'botbuilder';
+import type { Request as BotRequest, Response as BotResponse } from 'botbuilder';
 import { buildPollTally, buildSlackBlocks, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
 import { kvDelete, kvGetJson, kvGetRaw, kvListKeys, kvSet } from '@/lib/kv';
 import { getTeamsConversationReference, storeConversationReference, teamsBotConfigReady, updateTeamsPoll } from '@/lib/teams';
@@ -23,7 +24,7 @@ class WebApiResponse {
         return this;
     }
 
-    send(body?: any) {
+    send(body?: unknown) {
         if (body === undefined || body === null) {
             this.body = null;
         } else if (typeof body === 'string') {
@@ -52,7 +53,7 @@ function pollVoteKey(pollId: string, voterKey: string) {
 }
 
 async function getPollMeta(pollId: string): Promise<PollMeta | null> {
-    const raw = await kvGetJson<any>(`poll:${pollId}:meta`);
+    const raw = await kvGetJson<unknown>(`poll:${pollId}:meta`);
     return normalizeLegacyMeta(raw);
 }
 
@@ -109,13 +110,26 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
     }
 }
 
-async function handleVote(context: TurnContext) {
-    const value = (context.activity.value as any)?.data || context.activity.value;
+type SubmitData = { pollId?: string; optionIdx?: number | string };
+
+function extractSubmitData(value: unknown): SubmitData | null {
     if (!value || typeof value !== 'object') {
+        return null;
+    }
+    const root = value as Record<string, unknown>;
+    const data = root.data && typeof root.data === 'object' ? (root.data as Record<string, unknown>) : root;
+    const pollId = typeof data.pollId === 'string' ? data.pollId : undefined;
+    const optionIdx = typeof data.optionIdx === 'number' || typeof data.optionIdx === 'string' ? data.optionIdx : undefined;
+    return { pollId, optionIdx };
+}
+
+async function handleVote(context: TurnContext) {
+    const submit = extractSubmitData(context.activity.value);
+    if (!submit?.pollId) {
         return;
     }
-    const pollId = value.pollId;
-    const optionIdx = parseInt(String(value.optionIdx), 10);
+    const pollId = submit.pollId;
+    const optionIdx = parseInt(String(submit.optionIdx), 10);
     if (!pollId || Number.isNaN(optionIdx)) {
         return;
     }
@@ -123,7 +137,8 @@ async function handleVote(context: TurnContext) {
     if (!meta) {
         return;
     }
-    const userId = (context.activity.from as any)?.aadObjectId || context.activity.from?.id;
+    const from = context.activity.from as { aadObjectId?: string; id?: string } | undefined;
+    const userId = from?.aadObjectId || from?.id;
     if (!userId) {
         return;
     }
@@ -142,13 +157,13 @@ async function handleVote(context: TurnContext) {
 export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const headers = Object.fromEntries(req.headers.entries());
-    const webRequest = {
+    const webRequest: BotRequest = {
         body,
         headers,
         method: req.method
     };
     const webResponse = new WebApiResponse();
-    await adapter.process(webRequest as any, webResponse as any, async (context) => {
+    await adapter.process(webRequest, webResponse as unknown as BotResponse, async (context) => {
         await storeConversationReference(context);
         await handleVote(context);
     });
