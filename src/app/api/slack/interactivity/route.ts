@@ -29,6 +29,14 @@ async function getSlackTsForPoll(pollId: string) {
     return typeof raw === 'string' ? raw : null;
 }
 
+async function getTeamsReferenceForPoll(pollId: string) {
+    const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
+    if (typeof teamsRefKey === 'string' && teamsRefKey.length > 0) {
+        return kvGetJson(teamsRefKey);
+    }
+    return getTeamsConversationReference();
+}
+
 async function listVotes(pollId: string) {
     const keys = await kvListKeys(`poll:${pollId}:vote:*`);
     const votes: Array<{ voter?: string; optionIdx: number }> = [];
@@ -54,7 +62,7 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta, slackChannelI
     const votes = await listVotes(pollId);
     const tally = buildPollTally(meta.options.length, votes);
     const blocks = buildSlackBlocks(meta, tally);
-    await fetch('https://slack.com/api/chat.update', {
+    const slackRes = await fetch('https://slack.com/api/chat.update', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -66,11 +74,18 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta, slackChannelI
             blocks
         })
     });
+    const slackData = await slackRes.json().catch(() => null);
+    if (!slackRes.ok || !slackData?.ok) {
+        console.error('Failed to update Slack poll from interactivity route', {
+            pollId,
+            status: slackRes.status,
+            slackError: slackData?.error
+        });
+    }
 
     if (teamsBotConfigReady()) {
         const teamsActivityId = await kvGetRaw(`poll:${pollId}:teams_activity_id`);
-        const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
-        const reference = teamsRefKey ? await kvGetRaw(String(teamsRefKey)) : await getTeamsConversationReference();
+        const reference = await getTeamsReferenceForPoll(pollId);
         if (typeof teamsActivityId === 'string' && reference) {
             await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId);
         }

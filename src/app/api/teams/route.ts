@@ -57,6 +57,14 @@ async function getPollMeta(pollId: string): Promise<PollMeta | null> {
     return normalizeLegacyMeta(raw);
 }
 
+async function getTeamsReferenceForPoll(pollId: string) {
+    const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
+    if (typeof teamsRefKey === 'string' && teamsRefKey.length > 0) {
+        return kvGetJson(teamsRefKey);
+    }
+    return getTeamsConversationReference();
+}
+
 async function listVotes(pollId: string) {
     const keys = await kvListKeys(`poll:${pollId}:vote:*`);
     const votes: Array<{ voter?: string; optionIdx: number }> = [];
@@ -86,7 +94,7 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
     const slackChannelId = await kvGetRaw(`poll:${pollId}:slack_channel_id`);
     if (typeof slackTs === 'string' && typeof slackChannelId === 'string') {
         const blocks = buildSlackBlocks(meta, tally);
-        await fetch('https://slack.com/api/chat.update', {
+        const slackRes = await fetch('https://slack.com/api/chat.update', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -98,12 +106,19 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
                 blocks
             })
         });
+        const slackData = await slackRes.json().catch(() => null);
+        if (!slackRes.ok || !slackData?.ok) {
+            console.error('Failed to update Slack poll from Teams route', {
+                pollId,
+                status: slackRes.status,
+                slackError: slackData?.error
+            });
+        }
     }
 
     if (teamsBotConfigReady()) {
         const teamsActivityId = await kvGetRaw(`poll:${pollId}:teams_activity_id`);
-        const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
-        const reference = teamsRefKey ? await kvGetRaw(String(teamsRefKey)) : await getTeamsConversationReference();
+        const reference = await getTeamsReferenceForPoll(pollId);
         if (typeof teamsActivityId === 'string' && reference) {
             await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId);
         }
@@ -112,15 +127,47 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
 
 type SubmitData = { pollId?: string; optionIdx?: number | string };
 
-function extractSubmitData(value: unknown): SubmitData | null {
+function asRecord(value: unknown) {
     if (!value || typeof value !== 'object') {
         return null;
     }
-    const root = value as Record<string, unknown>;
-    const data = root.data && typeof root.data === 'object' ? (root.data as Record<string, unknown>) : root;
-    const pollId = typeof data.pollId === 'string' ? data.pollId : undefined;
-    const optionIdx = typeof data.optionIdx === 'number' || typeof data.optionIdx === 'string' ? data.optionIdx : undefined;
+    return value as Record<string, unknown>;
+}
+
+function extractFromNode(value: unknown): SubmitData | null {
+    const node = asRecord(value);
+    if (!node) {
+        return null;
+    }
+    const pollId = typeof node.pollId === 'string' ? node.pollId : undefined;
+    const optionIdx = typeof node.optionIdx === 'number' || typeof node.optionIdx === 'string' ? node.optionIdx : undefined;
+    if (!pollId || optionIdx === undefined) {
+        return null;
+    }
     return { pollId, optionIdx };
+}
+
+function extractSubmitData(value: unknown): SubmitData | null {
+    const queue: unknown[] = [value];
+    const seen = new Set<unknown>();
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || typeof current !== 'object' || seen.has(current)) {
+            continue;
+        }
+        seen.add(current);
+        const match = extractFromNode(current);
+        if (match) {
+            return match;
+        }
+        const record = current as Record<string, unknown>;
+        for (const key of ['data', 'action', 'value', 'msteams']) {
+            if (record[key] && typeof record[key] === 'object') {
+                queue.push(record[key]);
+            }
+        }
+    }
+    return null;
 }
 
 async function handleVote(context: TurnContext) {
@@ -135,6 +182,9 @@ async function handleVote(context: TurnContext) {
     }
     const meta = await getPollMeta(pollId);
     if (!meta) {
+        return;
+    }
+    if (optionIdx < 0 || optionIdx >= meta.options.length) {
         return;
     }
     const from = context.activity.from as { aadObjectId?: string; id?: string } | undefined;

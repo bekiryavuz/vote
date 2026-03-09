@@ -28,6 +28,24 @@ export async function getTeamsConversationReference(teamId = TEAMS_TEAM_ID, chan
     return kvGetJson<ConversationReference>(key);
 }
 
+function parseConversationReference(raw: unknown): ConversationReference | null {
+    if (!raw) {
+        return null;
+    }
+    if (typeof raw === 'string') {
+        try {
+            const parsed = JSON.parse(raw);
+            return parsed as ConversationReference;
+        } catch {
+            return null;
+        }
+    }
+    if (typeof raw === 'object') {
+        return raw as ConversationReference;
+    }
+    return null;
+}
+
 type TeamsChannelData = {
     team?: { id?: string };
     channel?: { id?: string };
@@ -49,7 +67,8 @@ export async function storeConversationReference(context: TurnContext) {
     return key;
 }
 
-export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, reference: ConversationReference) {
+export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, rawReference: unknown) {
+    const reference = parseConversationReference(rawReference);
     if (!reference) {
         return null;
     }
@@ -71,7 +90,8 @@ export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollT
     return activityId;
 }
 
-export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, reference: ConversationReference, activityId: string) {
+export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, rawReference: unknown, activityId: string) {
+    const reference = parseConversationReference(rawReference);
     if (!reference || !activityId) {
         return;
     }
