@@ -19,7 +19,12 @@ function slackVoterKey(userId: string) {
 }
 
 function normalizeIdentity(value: string) {
-    return value.trim().toLowerCase();
+    return value
+        .trim()
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/\p{M}+/gu, '')
+        .replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
 async function getPollIdBySlackTs(ts: string) {

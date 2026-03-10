@@ -57,7 +57,12 @@ function pollVoteTsKey(pollId: string, voterKey: string) {
 }
 
 function normalizeIdentity(value: string) {
-    return value.trim().toLowerCase();
+    return value
+        .trim()
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/\p{M}+/gu, '')
+        .replace(/[^\p{L}\p{N}]+/gu, '');
 }
 
 async function getPollMeta(pollId: string): Promise<PollMeta | null> {
@@ -264,6 +269,43 @@ function getTargetActivityIdCandidates(activity: ActivityWithFallbackIds) {
     return Array.from(deduped);
 }
 
+function collectActivityIdsFromValue(value: unknown, max = 30) {
+    const found = new Set<string>();
+    const queue: unknown[] = [value];
+    const seen = new Set<unknown>();
+
+    while (queue.length > 0 && found.size < max) {
+        const current = queue.shift();
+        if (!current || typeof current !== 'object' || seen.has(current)) {
+            continue;
+        }
+        seen.add(current);
+
+        if (Array.isArray(current)) {
+            for (const item of current) {
+                queue.push(item);
+            }
+            continue;
+        }
+
+        const record = current as Record<string, unknown>;
+        for (const [rawKey, rawVal] of Object.entries(record)) {
+            const key = rawKey.toLowerCase();
+            if (
+                typeof rawVal === 'string' &&
+                rawVal.trim().length > 0 &&
+                (key.includes('replytoid') || key.includes('activityid') || key.includes('messageid'))
+            ) {
+                found.add(rawVal.trim());
+            }
+            if (rawVal && typeof rawVal === 'object') {
+                queue.push(rawVal);
+            }
+        }
+    }
+    return Array.from(found);
+}
+
 function asRecord(value: unknown) {
     if (!value || typeof value !== 'object') {
         return null;
@@ -357,7 +399,10 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
 
     await updateSlackAndTeams(pollId, meta, {
         reference: currentReference,
-        activityIds: getTargetActivityIdCandidates(activityWithFallbackIds),
+        activityIds: [
+            ...getTargetActivityIdCandidates(activityWithFallbackIds),
+            ...collectActivityIdsFromValue(context.activity)
+        ],
         turnContext: context
     });
 }
