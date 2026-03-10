@@ -15,6 +15,16 @@ export type PollTally = {
     totalVotes: number;
 };
 
+function formatSlackVoter(voter: string) {
+    if (voter.startsWith('slack:')) {
+        return `<@${voter.replace('slack:', '')}>`;
+    }
+    if (voter.startsWith('teams:')) {
+        return `Teams:${voter.replace('teams:', '')}`;
+    }
+    return `<@${voter}>`;
+}
+
 export function buildPollTally(optionsCount: number, votes: Array<{ voter?: string; optionIdx: number }>): PollTally {
     const counts = Array(optionsCount).fill(0);
     const voters: string[][] = Array.from({ length: optionsCount }, () => []);
@@ -47,7 +57,7 @@ export function buildSlackBlocks(meta: PollMeta, tally: PollTally) {
         ...meta.options.map((opt, i) => {
             const percent = tally.totalVotes === 0 ? 0 : Math.round((tally.counts[i] / tally.totalVotes) * 100);
             const bar = renderBar(percent, tally.counts[i]);
-            const mentions = tally.voters[i].map((voter) => `<@${voter}>`).join(' ');
+            const mentions = tally.voters[i].map((voter) => formatSlackVoter(voter)).join(' ');
             return {
                 type: 'section',
                 text: {

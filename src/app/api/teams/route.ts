@@ -76,12 +76,20 @@ async function listVotes(pollId: string) {
             continue;
         }
         const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
-        const voter = voterKey.startsWith('teams:')
-            ? null
-            : voterKey.startsWith('slack:')
-                ? voterKey.replace('slack:', '')
-                : voterKey;
-        votes.push({ voter: voter || undefined, optionIdx: idx });
+        let voter: string | undefined;
+        if (voterKey.startsWith('teams:')) {
+            const teamsUserId = voterKey.replace('teams:', '');
+            const teamsNameRaw = await kvGetRaw(`poll:${pollId}:teams_user_name:${teamsUserId}`);
+            const teamsName = typeof teamsNameRaw === 'string' && teamsNameRaw.trim().length > 0
+                ? teamsNameRaw.trim()
+                : teamsUserId;
+            voter = `teams:${teamsName}`;
+        } else if (voterKey.startsWith('slack:')) {
+            voter = voterKey;
+        } else {
+            voter = voterKey;
+        }
+        votes.push({ voter, optionIdx: idx });
     }
     return votes;
 }
@@ -170,7 +178,7 @@ function extractSubmitData(value: unknown): SubmitData | null {
     return null;
 }
 
-async function handleVote(context: TurnContext) {
+async function handleVote(context: TurnContext, storedRefKey: string | null) {
     const submit = extractSubmitData(context.activity.value);
     if (!submit?.pollId) {
         return;
@@ -191,6 +199,16 @@ async function handleVote(context: TurnContext) {
     const userId = from?.aadObjectId || from?.id;
     if (!userId) {
         return;
+    }
+    if (storedRefKey) {
+        await kvSet(`poll:${pollId}:teams_ref_key`, storedRefKey);
+    }
+    const userName = typeof context.activity.from?.name === 'string' ? context.activity.from.name.trim() : '';
+    if (userName.length > 0) {
+        await kvSet(`poll:${pollId}:teams_user_name:${userId}`, userName);
+    }
+    if (context.activity.replyToId) {
+        await kvSet(`poll:${pollId}:teams_activity_id`, context.activity.replyToId);
     }
     const voteKey = pollVoteKey(pollId, `teams:${userId}`);
     const currentVal = await kvGetRaw(voteKey);
@@ -214,8 +232,8 @@ export async function POST(req: Request) {
     };
     const webResponse = new WebApiResponse();
     await adapter.process(webRequest, webResponse as unknown as BotResponse, async (context) => {
-        await storeConversationReference(context);
-        await handleVote(context);
+        const storedRefKey = await storeConversationReference(context);
+        await handleVote(context, storedRefKey);
     });
     return webResponse.toResponse();
 }

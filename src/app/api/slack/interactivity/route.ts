@@ -48,12 +48,20 @@ async function listVotes(pollId: string) {
             continue;
         }
         const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
-        const voter = voterKey.startsWith('teams:')
-            ? null
-            : voterKey.startsWith('slack:')
-                ? voterKey.replace('slack:', '')
-                : voterKey;
-        votes.push({ voter: voter || undefined, optionIdx: idx });
+        let voter: string | undefined;
+        if (voterKey.startsWith('teams:')) {
+            const teamsUserId = voterKey.replace('teams:', '');
+            const teamsNameRaw = await kvGetRaw(`poll:${pollId}:teams_user_name:${teamsUserId}`);
+            const teamsName = typeof teamsNameRaw === 'string' && teamsNameRaw.trim().length > 0
+                ? teamsNameRaw.trim()
+                : teamsUserId;
+            voter = `teams:${teamsName}`;
+        } else if (voterKey.startsWith('slack:')) {
+            voter = voterKey;
+        } else {
+            voter = voterKey;
+        }
+        votes.push({ voter, optionIdx: idx });
     }
     return votes;
 }
