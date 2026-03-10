@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { randomUUID } from 'node:crypto';
 import { buildPollTally, buildSlackBlocks, PollMeta } from '@/lib/poll';
 import { kvSet } from '@/lib/kv';
-import { getTeamsConversationReference, getTeamsRefKey, sendTeamsPoll, teamsBotConfigReady } from '@/lib/teams';
+import { resolveTeamsConversationReference, sendTeamsPoll, teamsBotConfigReady } from '@/lib/teams';
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
 const SLACK_CHANNEL_ID = process.env.SLACK_CHANNEL_ID!;
@@ -57,15 +57,12 @@ export async function POST() {
     let teamsError: string | null = null;
     if (teamsBotConfigReady()) {
         try {
-            const reference = await getTeamsConversationReference();
-            if (!reference) {
+            const resolved = await resolveTeamsConversationReference();
+            if (!resolved) {
                 teamsError = 'Teams conversation reference missing';
             } else {
-                const refKey = getTeamsRefKey();
-                if (refKey) {
-                    await kvSet(`poll:${pollId}:teams_ref_key`, refKey);
-                }
-                teamsActivityId = await sendTeamsPoll(pollId, meta, tally, reference);
+                await kvSet(`poll:${pollId}:teams_ref_key`, resolved.key);
+                teamsActivityId = await sendTeamsPoll(pollId, meta, tally, resolved.reference);
                 if (teamsActivityId) {
                     await kvSet(`poll:${pollId}:teams_activity_id`, teamsActivityId);
                 } else {

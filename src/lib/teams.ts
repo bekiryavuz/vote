@@ -1,5 +1,5 @@
 import { TurnContext, ConversationReference } from 'botbuilder';
-import { kvGetJson, kvSet } from '@/lib/kv';
+import { kvGetJson, kvListKeys, kvSet } from '@/lib/kv';
 import { buildTeamsCard, PollMeta, PollTally } from '@/lib/poll';
 import { adapter, botAppId } from '@/lib/teamsAdapter';
 
@@ -20,12 +20,52 @@ export function getTeamsRefKey(teamId = TEAMS_TEAM_ID, channelId = TEAMS_CHANNEL
     return `teams:conversation_ref:${teamId}:${channelId}`;
 }
 
-export async function getTeamsConversationReference(teamId = TEAMS_TEAM_ID, channelId = TEAMS_CHANNEL_ID) {
-    const key = getTeamsRefKey(teamId, channelId);
+type ResolvedTeamsReference = {
+    key: string;
+    reference: ConversationReference;
+};
+
+async function resolveKeyByPatterns(teamId = TEAMS_TEAM_ID, channelId = TEAMS_CHANNEL_ID): Promise<string | null> {
+    const exactKey = getTeamsRefKey(teamId, channelId);
+    if (exactKey) {
+        const exact = await kvGetJson<ConversationReference>(exactKey);
+        if (exact) {
+            return exactKey;
+        }
+    }
+
+    if (channelId) {
+        const byChannel = await kvListKeys(`teams:conversation_ref:*:${channelId}`);
+        if (byChannel.length > 0) {
+            return byChannel[0];
+        }
+    }
+
+    if (teamId) {
+        const byTeam = await kvListKeys(`teams:conversation_ref:${teamId}:*`);
+        if (byTeam.length > 0) {
+            return byTeam[0];
+        }
+    }
+
+    return null;
+}
+
+export async function resolveTeamsConversationReference(teamId = TEAMS_TEAM_ID, channelId = TEAMS_CHANNEL_ID): Promise<ResolvedTeamsReference | null> {
+    const key = await resolveKeyByPatterns(teamId, channelId);
     if (!key) {
         return null;
     }
-    return kvGetJson<ConversationReference>(key);
+    const reference = await kvGetJson<ConversationReference>(key);
+    if (!reference) {
+        return null;
+    }
+    return { key, reference };
+}
+
+export async function getTeamsConversationReference(teamId = TEAMS_TEAM_ID, channelId = TEAMS_CHANNEL_ID) {
+    const resolved = await resolveTeamsConversationReference(teamId, channelId);
+    return resolved?.reference ?? null;
 }
 
 function parseConversationReference(raw: unknown): ConversationReference | null {
