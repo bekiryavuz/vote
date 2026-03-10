@@ -10,8 +10,16 @@ function pollVoteKey(pollId: string, voterKey: string) {
     return `poll:${pollId}:vote:${voterKey}`;
 }
 
+function pollVoteTsKey(pollId: string, voterKey: string) {
+    return `poll:${pollId}:vote_ts:${voterKey}`;
+}
+
 function slackVoterKey(userId: string) {
     return `slack:${userId}`;
+}
+
+function normalizeIdentity(value: string) {
+    return value.trim().toLowerCase();
 }
 
 async function getPollIdBySlackTs(ts: string) {
@@ -43,7 +51,7 @@ async function getTeamsReferenceForPoll(pollId: string) {
 
 async function listVotes(pollId: string) {
     const keys = await kvListKeys(`poll:${pollId}:vote:*`);
-    const votes: Array<{ voter?: string; optionIdx: number }> = [];
+    const deduped = new Map<string, { voter?: string; optionIdx: number; updatedAt: number }>();
     const prefix = `poll:${pollId}:vote:`;
     for (const key of keys) {
         const raw = await kvGetRaw(key);
@@ -52,7 +60,11 @@ async function listVotes(pollId: string) {
             continue;
         }
         const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+        const tsRaw = await kvGetRaw(pollVoteTsKey(pollId, voterKey));
+        const updatedAt = parseInt(String(tsRaw), 10);
+        const ts = Number.isNaN(updatedAt) ? 0 : updatedAt;
         let voter: string | undefined;
+        let identityKey: string;
         if (voterKey.startsWith('teams:')) {
             const teamsUserId = voterKey.replace('teams:', '');
             const teamsNameRaw = await kvGetRaw(`poll:${pollId}:teams_user_name:${teamsUserId}`);
@@ -60,14 +72,25 @@ async function listVotes(pollId: string) {
                 ? teamsNameRaw.trim()
                 : teamsUserId;
             voter = `teams:${teamsName}`;
+            identityKey = `name:${normalizeIdentity(teamsName)}`;
         } else if (voterKey.startsWith('slack:')) {
             voter = voterKey;
+            const slackUserId = voterKey.replace('slack:', '');
+            const slackNameRaw = await kvGetRaw(`poll:${pollId}:slack_user_name:${slackUserId}`);
+            const slackName = typeof slackNameRaw === 'string' && slackNameRaw.trim().length > 0
+                ? slackNameRaw.trim()
+                : '';
+            identityKey = slackName ? `name:${normalizeIdentity(slackName)}` : `slack:${slackUserId}`;
         } else {
             voter = voterKey;
+            identityKey = `raw:${voterKey}`;
         }
-        votes.push({ voter, optionIdx: idx });
+        const existing = deduped.get(identityKey);
+        if (!existing || ts >= existing.updatedAt) {
+            deduped.set(identityKey, { voter, optionIdx: idx, updatedAt: ts });
+        }
     }
-    return votes;
+    return Array.from(deduped.values()).map(({ voter, optionIdx }) => ({ voter, optionIdx }));
 }
 
 async function updateSlackAndTeams(pollId: string, meta: PollMeta, slackChannelId: string, slackTs: string) {
@@ -162,6 +185,7 @@ export async function POST(req: NextRequest) {
         try {
             const action = payload.actions[0];
             const userId = payload.user.id;
+            const slackName = payload.user?.name || payload.user?.username || userId;
             const optionIdx = parseInt(action.value.replace('option_', ''));
             const ts = payload.message.ts;
             const channelId = payload.channel.id;
@@ -173,7 +197,9 @@ export async function POST(req: NextRequest) {
             }
 
             const prefixedKey = pollVoteKey(pollId, slackVoterKey(userId));
+            const prefixedTsKey = pollVoteTsKey(pollId, slackVoterKey(userId));
             const legacyKey = pollVoteKey(pollId, userId);
+            const legacyTsKey = pollVoteTsKey(pollId, userId);
             const prefixedVal = await kvGetRaw(prefixedKey);
             const legacyVal = await kvGetRaw(legacyKey);
             const prefixedIdx = parseInt(String(prefixedVal), 10);
@@ -190,11 +216,15 @@ export async function POST(req: NextRequest) {
 
             if (currentKey && currentIdx === optionIdx) {
                 await kvDelete(currentKey);
+                await kvDelete(currentKey === prefixedKey ? prefixedTsKey : legacyTsKey);
             } else {
                 if (currentKey === legacyKey) {
                     await kvDelete(legacyKey);
+                    await kvDelete(legacyTsKey);
                 }
                 await kvSet(prefixedKey, String(optionIdx));
+                await kvSet(prefixedTsKey, String(Date.now()));
+                await kvSet(`poll:${pollId}:slack_user_name:${userId}`, String(slackName));
             }
 
             const slackTs = (await getSlackTsForPoll(pollId)) || ts;

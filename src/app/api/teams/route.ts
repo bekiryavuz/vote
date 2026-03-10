@@ -1,6 +1,6 @@
 import { TurnContext } from 'botbuilder';
 import type { Request as BotRequest, Response as BotResponse } from 'botbuilder';
-import { buildPollTally, buildSlackBlocks, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
+import { buildPollTally, buildSlackBlocks, buildTeamsCard, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
 import { kvDelete, kvGetJson, kvGetRaw, kvListKeys, kvSet } from '@/lib/kv';
 import { getTeamsConversationReference, storeConversationReference, teamsBotConfigReady, updateTeamsPoll } from '@/lib/teams';
 import { adapter } from '@/lib/teamsAdapter';
@@ -52,6 +52,14 @@ function pollVoteKey(pollId: string, voterKey: string) {
     return `poll:${pollId}:vote:${voterKey}`;
 }
 
+function pollVoteTsKey(pollId: string, voterKey: string) {
+    return `poll:${pollId}:vote_ts:${voterKey}`;
+}
+
+function normalizeIdentity(value: string) {
+    return value.trim().toLowerCase();
+}
+
 async function getPollMeta(pollId: string): Promise<PollMeta | null> {
     const raw = await kvGetJson<unknown>(`poll:${pollId}:meta`);
     return normalizeLegacyMeta(raw);
@@ -71,7 +79,7 @@ async function getTeamsReferenceForPoll(pollId: string) {
 
 async function listVotes(pollId: string) {
     const keys = await kvListKeys(`poll:${pollId}:vote:*`);
-    const votes: Array<{ voter?: string; optionIdx: number }> = [];
+    const deduped = new Map<string, { voter?: string; optionIdx: number; updatedAt: number }>();
     const prefix = `poll:${pollId}:vote:`;
     for (const key of keys) {
         const raw = await kvGetRaw(key);
@@ -80,7 +88,11 @@ async function listVotes(pollId: string) {
             continue;
         }
         const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+        const tsRaw = await kvGetRaw(pollVoteTsKey(pollId, voterKey));
+        const updatedAt = parseInt(String(tsRaw), 10);
+        const ts = Number.isNaN(updatedAt) ? 0 : updatedAt;
         let voter: string | undefined;
+        let identityKey: string;
         if (voterKey.startsWith('teams:')) {
             const teamsUserId = voterKey.replace('teams:', '');
             const teamsNameRaw = await kvGetRaw(`poll:${pollId}:teams_user_name:${teamsUserId}`);
@@ -88,19 +100,31 @@ async function listVotes(pollId: string) {
                 ? teamsNameRaw.trim()
                 : teamsUserId;
             voter = `teams:${teamsName}`;
+            identityKey = `name:${normalizeIdentity(teamsName)}`;
         } else if (voterKey.startsWith('slack:')) {
             voter = voterKey;
+            const slackUserId = voterKey.replace('slack:', '');
+            const slackNameRaw = await kvGetRaw(`poll:${pollId}:slack_user_name:${slackUserId}`);
+            const slackName = typeof slackNameRaw === 'string' && slackNameRaw.trim().length > 0
+                ? slackNameRaw.trim()
+                : '';
+            identityKey = slackName ? `name:${normalizeIdentity(slackName)}` : `slack:${slackUserId}`;
         } else {
             voter = voterKey;
+            identityKey = `raw:${voterKey}`;
         }
-        votes.push({ voter, optionIdx: idx });
+        const existing = deduped.get(identityKey);
+        if (!existing || ts >= existing.updatedAt) {
+            deduped.set(identityKey, { voter, optionIdx: idx, updatedAt: ts });
+        }
     }
-    return votes;
+    return Array.from(deduped.values()).map(({ voter, optionIdx }) => ({ voter, optionIdx }));
 }
 
 type TeamsUpdateHints = {
     reference?: unknown;
     activityIds?: string[];
+    turnContext?: TurnContext;
 };
 
 async function updateSlackAndTeams(pollId: string, meta: PollMeta, teamsHints?: TeamsUpdateHints) {
@@ -148,6 +172,33 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta, teamsHints?: 
         if (reference && candidateIds.size > 0) {
             let updated = false;
             let lastError: unknown = null;
+            const candidateIdsArray = Array.from(candidateIds);
+            if (teamsHints?.turnContext) {
+                for (const activityId of candidateIdsArray) {
+                    try {
+                        const card = buildTeamsCard(meta, tally, pollId);
+                        await teamsHints.turnContext.updateActivity({
+                            type: 'message',
+                            id: activityId,
+                            text: meta.question,
+                            attachments: [
+                                {
+                                    contentType: 'application/vnd.microsoft.card.adaptive',
+                                    content: card
+                                }
+                            ]
+                        });
+                        await kvSet(`poll:${pollId}:teams_activity_id`, activityId);
+                        updated = true;
+                        break;
+                    } catch (error) {
+                        lastError = error;
+                    }
+                }
+            }
+            if (updated) {
+                return;
+            }
             for (const activityId of candidateIds) {
                 try {
                     await updateTeamsPoll(pollId, meta, tally, reference, activityId);
@@ -161,7 +212,7 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta, teamsHints?: 
             if (!updated) {
                 console.error('Failed to update Teams poll from Teams route', {
                     pollId,
-                    candidateActivityIds: Array.from(candidateIds),
+                    candidateActivityIds: candidateIdsArray,
                     error: lastError
                 });
             }
@@ -293,17 +344,21 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
         await kvSet(`poll:${pollId}:teams_activity_id`, targetActivityId);
     }
     const voteKey = pollVoteKey(pollId, `teams:${userId}`);
+    const voteTsKey = pollVoteTsKey(pollId, `teams:${userId}`);
     const currentVal = await kvGetRaw(voteKey);
     const currentIdx = parseInt(String(currentVal), 10);
     if (!Number.isNaN(currentIdx) && currentIdx === optionIdx) {
         await kvDelete(voteKey);
+        await kvDelete(voteTsKey);
     } else {
         await kvSet(voteKey, String(optionIdx));
+        await kvSet(voteTsKey, String(Date.now()));
     }
 
     await updateSlackAndTeams(pollId, meta, {
         reference: currentReference,
-        activityIds: getTargetActivityIdCandidates(activityWithFallbackIds)
+        activityIds: getTargetActivityIdCandidates(activityWithFallbackIds),
+        turnContext: context
     });
 }
 
