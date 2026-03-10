@@ -15,6 +15,23 @@ export type PollTally = {
     totalVotes: number;
 };
 
+function toTeamsEmoji(emojiCode: string) {
+    const normalized = emojiCode.trim().toLowerCase();
+    if (normalized === ':house_with_garden:') {
+        return '🏡';
+    }
+    if (normalized === ':office:') {
+        return '🏢';
+    }
+    if (normalized === ':grey_question:') {
+        return '❔';
+    }
+    if (normalized.startsWith(':') && normalized.endsWith(':')) {
+        return normalized.slice(1, -1).replaceAll('_', ' ');
+    }
+    return normalized;
+}
+
 function formatSlackVoter(voter: string) {
     if (voter.startsWith('slack:')) {
         return `<@${voter.replace('slack:', '')}>`;
@@ -93,8 +110,9 @@ export function buildTeamsCard(meta: PollMeta, tally: PollTally, pollId: string)
         ...meta.options.flatMap((opt, i) => {
             const percent = tally.totalVotes === 0 ? 0 : Math.round((tally.counts[i] / tally.totalVotes) * 100);
             const bar = renderBar(percent, tally.counts[i]);
+            const emoji = toTeamsEmoji(opt.emoji);
             return [
-                { type: 'TextBlock', text: `${i + 1}. ${opt.label} ${opt.emoji}`, wrap: true, spacing: 'Small' },
+                { type: 'TextBlock', text: `${i + 1}. ${opt.label} ${emoji}`, wrap: true, spacing: 'Small' },
                 { type: 'TextBlock', text: `${bar}`, wrap: true, spacing: 'None' }
             ];
         }),
@@ -103,7 +121,7 @@ export function buildTeamsCard(meta: PollMeta, tally: PollTally, pollId: string)
 
     const actions = meta.options.map((opt, i) => ({
         type: 'Action.Submit',
-        title: `Vote #${i + 1}`,
+        title: `${toTeamsEmoji(opt.emoji)} ${opt.label}`,
         data: { pollId, optionIdx: i }
     }));
 
