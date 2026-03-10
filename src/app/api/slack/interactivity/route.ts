@@ -30,6 +30,10 @@ async function getSlackTsForPoll(pollId: string) {
 }
 
 async function getTeamsReferenceForPoll(pollId: string) {
+    const inlineReference = await kvGetJson(`poll:${pollId}:teams_ref_inline`);
+    if (inlineReference) {
+        return inlineReference;
+    }
     const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
     if (typeof teamsRefKey === 'string' && teamsRefKey.length > 0) {
         return kvGetJson(teamsRefKey);

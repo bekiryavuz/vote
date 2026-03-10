@@ -58,6 +58,10 @@ async function getPollMeta(pollId: string): Promise<PollMeta | null> {
 }
 
 async function getTeamsReferenceForPoll(pollId: string) {
+    const inlineReference = await kvGetJson(`poll:${pollId}:teams_ref_inline`);
+    if (inlineReference) {
+        return inlineReference;
+    }
     const teamsRefKey = await kvGetRaw(`poll:${pollId}:teams_ref_key`);
     if (typeof teamsRefKey === 'string' && teamsRefKey.length > 0) {
         return kvGetJson(teamsRefKey);
@@ -94,7 +98,12 @@ async function listVotes(pollId: string) {
     return votes;
 }
 
-async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
+type TeamsUpdateHints = {
+    reference?: unknown;
+    activityIds?: string[];
+};
+
+async function updateSlackAndTeams(pollId: string, meta: PollMeta, teamsHints?: TeamsUpdateHints) {
     const votes = await listVotes(pollId);
     const tally = buildPollTally(meta.options.length, votes);
 
@@ -125,16 +134,35 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
     }
 
     if (teamsBotConfigReady()) {
+        const reference = teamsHints?.reference || await getTeamsReferenceForPoll(pollId);
         const teamsActivityId = await kvGetRaw(`poll:${pollId}:teams_activity_id`);
-        const reference = await getTeamsReferenceForPoll(pollId);
-        if (typeof teamsActivityId === 'string' && reference) {
-            try {
-                await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId);
-            } catch (error) {
+        const candidateIds = new Set<string>();
+        if (typeof teamsActivityId === 'string' && teamsActivityId.trim().length > 0) {
+            candidateIds.add(teamsActivityId.trim());
+        }
+        for (const id of teamsHints?.activityIds || []) {
+            if (typeof id === 'string' && id.trim().length > 0) {
+                candidateIds.add(id.trim());
+            }
+        }
+        if (reference && candidateIds.size > 0) {
+            let updated = false;
+            let lastError: unknown = null;
+            for (const activityId of candidateIds) {
+                try {
+                    await updateTeamsPoll(pollId, meta, tally, reference, activityId);
+                    await kvSet(`poll:${pollId}:teams_activity_id`, activityId);
+                    updated = true;
+                    break;
+                } catch (error) {
+                    lastError = error;
+                }
+            }
+            if (!updated) {
                 console.error('Failed to update Teams poll from Teams route', {
                     pollId,
-                    teamsActivityId,
-                    error
+                    candidateActivityIds: Array.from(candidateIds),
+                    error: lastError
                 });
             }
         }
@@ -155,8 +183,8 @@ type ActivityWithFallbackIds = {
 function getTargetActivityId(activity: ActivityWithFallbackIds) {
     const candidates = [
         activity.replyToId,
-        activity.relatesTo?.activityId,
         activity.channelData?.legacy?.replyToId,
+        activity.relatesTo?.activityId,
         activity.channelData?.messageid,
         activity.channelData?.messageId
     ];
@@ -166,6 +194,23 @@ function getTargetActivityId(activity: ActivityWithFallbackIds) {
         }
     }
     return null;
+}
+
+function getTargetActivityIdCandidates(activity: ActivityWithFallbackIds) {
+    const candidates = [
+        activity.replyToId,
+        activity.channelData?.legacy?.replyToId,
+        activity.relatesTo?.activityId,
+        activity.channelData?.messageid,
+        activity.channelData?.messageId
+    ];
+    const deduped = new Set<string>();
+    for (const value of candidates) {
+        if (typeof value === 'string' && value.trim().length > 0) {
+            deduped.add(value.trim());
+        }
+    }
+    return Array.from(deduped);
 }
 
 function asRecord(value: unknown) {
@@ -233,14 +278,17 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
     if (!userId) {
         return;
     }
+    const currentReference = TurnContext.getConversationReference(context.activity);
     if (storedRefKey) {
         await kvSet(`poll:${pollId}:teams_ref_key`, storedRefKey);
     }
+    await kvSet(`poll:${pollId}:teams_ref_inline`, currentReference);
     const userName = typeof context.activity.from?.name === 'string' ? context.activity.from.name.trim() : '';
     if (userName.length > 0) {
         await kvSet(`poll:${pollId}:teams_user_name:${userId}`, userName);
     }
-    const targetActivityId = getTargetActivityId(context.activity as unknown as ActivityWithFallbackIds);
+    const activityWithFallbackIds = context.activity as unknown as ActivityWithFallbackIds;
+    const targetActivityId = getTargetActivityId(activityWithFallbackIds);
     if (targetActivityId) {
         await kvSet(`poll:${pollId}:teams_activity_id`, targetActivityId);
     }
@@ -253,7 +301,10 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
         await kvSet(voteKey, String(optionIdx));
     }
 
-    await updateSlackAndTeams(pollId, meta);
+    await updateSlackAndTeams(pollId, meta, {
+        reference: currentReference,
+        activityIds: getTargetActivityIdCandidates(activityWithFallbackIds)
+    });
 }
 
 export async function POST(req: Request) {
