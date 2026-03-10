@@ -142,6 +142,31 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
 }
 
 type SubmitData = { pollId?: string; optionIdx?: number | string };
+type ActivityWithFallbackIds = {
+    replyToId?: string;
+    relatesTo?: { activityId?: string };
+    channelData?: {
+        legacy?: { replyToId?: string };
+        messageid?: string;
+        messageId?: string;
+    };
+};
+
+function getTargetActivityId(activity: ActivityWithFallbackIds) {
+    const candidates = [
+        activity.replyToId,
+        activity.relatesTo?.activityId,
+        activity.channelData?.legacy?.replyToId,
+        activity.channelData?.messageid,
+        activity.channelData?.messageId
+    ];
+    for (const value of candidates) {
+        if (typeof value === 'string' && value.trim().length > 0) {
+            return value.trim();
+        }
+    }
+    return null;
+}
 
 function asRecord(value: unknown) {
     if (!value || typeof value !== 'object') {
@@ -215,8 +240,9 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
     if (userName.length > 0) {
         await kvSet(`poll:${pollId}:teams_user_name:${userId}`, userName);
     }
-    if (context.activity.replyToId) {
-        await kvSet(`poll:${pollId}:teams_activity_id`, context.activity.replyToId);
+    const targetActivityId = getTargetActivityId(context.activity as unknown as ActivityWithFallbackIds);
+    if (targetActivityId) {
+        await kvSet(`poll:${pollId}:teams_activity_id`, targetActivityId);
     }
     const voteKey = pollVoteKey(pollId, `teams:${userId}`);
     const currentVal = await kvGetRaw(voteKey);
