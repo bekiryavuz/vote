@@ -313,13 +313,40 @@ function asRecord(value: unknown) {
     return value as Record<string, unknown>;
 }
 
+function parseJsonString(value: unknown) {
+    if (typeof value !== 'string') {
+        return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+        return null;
+    }
+    try {
+        return JSON.parse(trimmed);
+    } catch {
+        return null;
+    }
+}
+
+function getRecordValueCaseInsensitive(record: Record<string, unknown>, keys: string[]) {
+    const lookup = new Set(keys.map((key) => key.toLowerCase()));
+    for (const [key, value] of Object.entries(record)) {
+        if (lookup.has(key.toLowerCase())) {
+            return value;
+        }
+    }
+    return undefined;
+}
+
 function extractFromNode(value: unknown): SubmitData | null {
     const node = asRecord(value);
     if (!node) {
         return null;
     }
-    const pollId = typeof node.pollId === 'string' ? node.pollId : undefined;
-    const optionIdx = typeof node.optionIdx === 'number' || typeof node.optionIdx === 'string' ? node.optionIdx : undefined;
+    const rawPollId = getRecordValueCaseInsensitive(node, ['pollId', 'poll_id', 'pollid']);
+    const rawOptionIdx = getRecordValueCaseInsensitive(node, ['optionIdx', 'option_idx', 'optionid', 'option']);
+    const pollId = typeof rawPollId === 'string' ? rawPollId : undefined;
+    const optionIdx = typeof rawOptionIdx === 'number' || typeof rawOptionIdx === 'string' ? rawOptionIdx : undefined;
     if (!pollId || optionIdx === undefined) {
         return null;
     }
@@ -331,7 +358,21 @@ function extractSubmitData(value: unknown): SubmitData | null {
     const seen = new Set<unknown>();
     while (queue.length > 0) {
         const current = queue.shift();
-        if (!current || typeof current !== 'object' || seen.has(current)) {
+        if (current == null) {
+            continue;
+        }
+        const parsed = parseJsonString(current);
+        if (parsed) {
+            queue.push(parsed);
+            continue;
+        }
+        if (Array.isArray(current)) {
+            for (const item of current) {
+                queue.push(item);
+            }
+            continue;
+        }
+        if (typeof current !== 'object' || seen.has(current)) {
             continue;
         }
         seen.add(current);
@@ -340,9 +381,17 @@ function extractSubmitData(value: unknown): SubmitData | null {
             return match;
         }
         const record = current as Record<string, unknown>;
-        for (const key of ['data', 'action', 'value', 'msteams']) {
-            if (record[key] && typeof record[key] === 'object') {
-                queue.push(record[key]);
+        for (const value of Object.values(record)) {
+            if (value == null) {
+                continue;
+            }
+            if (typeof value === 'object' || Array.isArray(value)) {
+                queue.push(value);
+                continue;
+            }
+            const parsedValue = parseJsonString(value);
+            if (parsedValue) {
+                queue.push(parsedValue);
             }
         }
     }
@@ -352,23 +401,39 @@ function extractSubmitData(value: unknown): SubmitData | null {
 async function handleVote(context: TurnContext, storedRefKey: string | null) {
     const submit = extractSubmitData(context.activity.value);
     if (!submit?.pollId) {
+        console.error('Teams vote ignored: submit payload not found', {
+            activityType: context.activity.type,
+            activityName: context.activity.name,
+            valueType: typeof context.activity.value
+        });
         return;
     }
     const pollId = submit.pollId;
     const optionIdx = parseInt(String(submit.optionIdx), 10);
     if (!pollId || Number.isNaN(optionIdx)) {
+        console.error('Teams vote ignored: invalid poll or option', {
+            pollId,
+            rawOptionIdx: submit.optionIdx
+        });
         return;
     }
     const meta = await getPollMeta(pollId);
     if (!meta) {
+        console.error('Teams vote ignored: poll meta missing', { pollId });
         return;
     }
     if (optionIdx < 0 || optionIdx >= meta.options.length) {
+        console.error('Teams vote ignored: option out of range', {
+            pollId,
+            optionIdx,
+            optionsLength: meta.options.length
+        });
         return;
     }
     const from = context.activity.from as { aadObjectId?: string; id?: string } | undefined;
     const userId = from?.aadObjectId || from?.id;
     if (!userId) {
+        console.error('Teams vote ignored: missing user id', { pollId });
         return;
     }
     const currentReference = TurnContext.getConversationReference(context.activity);
