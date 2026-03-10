@@ -128,7 +128,15 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
         const teamsActivityId = await kvGetRaw(`poll:${pollId}:teams_activity_id`);
         const reference = await getTeamsReferenceForPoll(pollId);
         if (typeof teamsActivityId === 'string' && reference) {
-            await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId);
+            try {
+                await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId);
+            } catch (error) {
+                console.error('Failed to update Teams poll from Teams route', {
+                    pollId,
+                    teamsActivityId,
+                    error
+                });
+            }
         }
     }
 }
@@ -233,7 +241,21 @@ export async function POST(req: Request) {
     const webResponse = new WebApiResponse();
     await adapter.process(webRequest, webResponse as unknown as BotResponse, async (context) => {
         const storedRefKey = await storeConversationReference(context);
-        await handleVote(context, storedRefKey);
+        if (context.activity.type === 'invoke') {
+            await context.sendActivity({
+                type: 'invokeResponse',
+                value: { status: 200 }
+            });
+        }
+        try {
+            await handleVote(context, storedRefKey);
+        } catch (error) {
+            console.error('Failed to handle Teams activity', {
+                type: context.activity.type,
+                name: context.activity.name,
+                error
+            });
+        }
     });
     return webResponse.toResponse();
 }
