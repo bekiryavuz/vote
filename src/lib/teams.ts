@@ -63,6 +63,11 @@ export async function storeConversationReference(context: TurnContext) {
     if (!key) {
         return null;
     }
+    const existing = await kvGetJson<ConversationReference>(key);
+    // Do not overwrite a channel-level reference with a thread reply reference.
+    if (context.activity.replyToId && existing) {
+        return key;
+    }
     await kvSet(key, reference);
     return key;
 }
@@ -85,7 +90,8 @@ export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollT
                 }
             ]
         });
-        activityId = response?.id ?? null;
+        const responseWithActivityId = response as { id?: string; activityId?: string } | undefined;
+        activityId = responseWithActivityId?.id ?? responseWithActivityId?.activityId ?? null;
     });
     return activityId;
 }
