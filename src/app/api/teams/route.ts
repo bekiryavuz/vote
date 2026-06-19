@@ -1,6 +1,6 @@
 import { TurnContext } from 'botbuilder';
 import type { Request as BotRequest, Response as BotResponse } from 'botbuilder';
-import { buildPollTally, buildSlackBlocks, buildTeamsCard, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
+import { buildPollTally, buildSlackBlocks, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
 import { kvDelete, kvGetJson, kvGetRaw, kvListKeys, kvSet } from '@/lib/kv';
 import { getTeamsConversationReference, storeConversationReference, teamsBotConfigReady, updateTeamsPoll } from '@/lib/teams';
 import { adapter } from '@/lib/teamsAdapter';
@@ -126,13 +126,7 @@ async function listVotes(pollId: string) {
     return Array.from(deduped.values()).map(({ voter, optionIdx }) => ({ voter, optionIdx }));
 }
 
-type TeamsUpdateHints = {
-    reference?: unknown;
-    activityIds?: string[];
-    turnContext?: TurnContext;
-};
-
-async function updateSlackAndTeams(pollId: string, meta: PollMeta, teamsHints?: TeamsUpdateHints) {
+async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
     const votes = await listVotes(pollId);
     const tally = buildPollTally(meta.options.length, votes);
 
@@ -163,148 +157,32 @@ async function updateSlackAndTeams(pollId: string, meta: PollMeta, teamsHints?: 
     }
 
     if (teamsBotConfigReady()) {
-        const reference = teamsHints?.reference || await getTeamsReferenceForPoll(pollId);
+        // Update against the send-time card id + channel reference captured when the poll
+        // was posted (/api/send-vote). The inbound vote's replyToId points at the thread
+        // root, not the card, so deriving the target from it silently breaks the update.
+        const reference = await getTeamsReferenceForPoll(pollId);
         const teamsActivityId = await kvGetRaw(`poll:${pollId}:teams_activity_id`);
-        const candidateIds = new Set<string>();
-        if (typeof teamsActivityId === 'string' && teamsActivityId.trim().length > 0) {
-            candidateIds.add(teamsActivityId.trim());
-        }
-        for (const id of teamsHints?.activityIds || []) {
-            if (typeof id === 'string' && id.trim().length > 0) {
-                candidateIds.add(id.trim());
-            }
-        }
-        if (reference && candidateIds.size > 0) {
-            let updated = false;
-            let lastError: unknown = null;
-            const candidateIdsArray = Array.from(candidateIds);
-            if (teamsHints?.turnContext) {
-                for (const activityId of candidateIdsArray) {
-                    try {
-                        const card = buildTeamsCard(meta, tally, pollId);
-                        await teamsHints.turnContext.updateActivity({
-                            type: 'message',
-                            id: activityId,
-                            text: meta.question,
-                            attachments: [
-                                {
-                                    contentType: 'application/vnd.microsoft.card.adaptive',
-                                    content: card
-                                }
-                            ]
-                        });
-                        await kvSet(`poll:${pollId}:teams_activity_id`, activityId);
-                        updated = true;
-                        break;
-                    } catch (error) {
-                        lastError = error;
-                    }
-                }
-            }
-            if (updated) {
-                return;
-            }
-            for (const activityId of candidateIds) {
-                try {
-                    await updateTeamsPoll(pollId, meta, tally, reference, activityId);
-                    await kvSet(`poll:${pollId}:teams_activity_id`, activityId);
-                    updated = true;
-                    break;
-                } catch (error) {
-                    lastError = error;
-                }
-            }
-            if (!updated) {
+        if (reference && typeof teamsActivityId === 'string' && teamsActivityId.trim().length > 0) {
+            try {
+                await updateTeamsPoll(pollId, meta, tally, reference, teamsActivityId.trim());
+            } catch (error) {
                 console.error('Failed to update Teams poll from Teams route', {
                     pollId,
-                    candidateActivityIds: candidateIdsArray,
-                    error: lastError
+                    teamsActivityId,
+                    error
                 });
             }
+        } else {
+            console.error('Teams poll update skipped: missing reference or activity id', {
+                pollId,
+                hasReference: Boolean(reference),
+                teamsActivityId
+            });
         }
     }
 }
 
 type SubmitData = { pollId?: string; optionIdx?: number | string };
-type ActivityWithFallbackIds = {
-    replyToId?: string;
-    relatesTo?: { activityId?: string };
-    channelData?: {
-        legacy?: { replyToId?: string };
-        messageid?: string;
-        messageId?: string;
-    };
-};
-
-function getTargetActivityId(activity: ActivityWithFallbackIds) {
-    const candidates = [
-        activity.replyToId,
-        activity.channelData?.legacy?.replyToId,
-        activity.relatesTo?.activityId,
-        activity.channelData?.messageid,
-        activity.channelData?.messageId
-    ];
-    for (const value of candidates) {
-        if (typeof value === 'string' && value.trim().length > 0) {
-            return value.trim();
-        }
-    }
-    return null;
-}
-
-function getTargetActivityIdCandidates(activity: ActivityWithFallbackIds) {
-    const candidates = [
-        activity.replyToId,
-        activity.channelData?.legacy?.replyToId,
-        activity.relatesTo?.activityId,
-        activity.channelData?.messageid,
-        activity.channelData?.messageId
-    ];
-    const deduped = new Set<string>();
-    for (const value of candidates) {
-        if (typeof value === 'string' && value.trim().length > 0) {
-            deduped.add(value.trim());
-        }
-    }
-    return Array.from(deduped);
-}
-
-function collectActivityIdsFromValue(value: unknown, max = 30) {
-    const found = new Set<string>();
-    const queue: unknown[] = [value];
-    const seen = new Set<unknown>();
-
-    while (queue.length > 0 && found.size < max) {
-        const current = queue.shift();
-        if (!current || typeof current !== 'object' || seen.has(current)) {
-            continue;
-        }
-        seen.add(current);
-
-        if (Array.isArray(current)) {
-            for (const item of current) {
-                queue.push(item);
-            }
-            continue;
-        }
-
-        const record = current as Record<string, unknown>;
-        for (const [rawKey, rawVal] of Object.entries(record)) {
-            const key = rawKey.toLowerCase();
-            if (
-                typeof rawVal === 'string' &&
-                rawVal.trim().length > 0 &&
-                (key.includes('replytoid') || key.includes('activityid') || key.includes('messageid'))
-            ) {
-                found.add(rawVal.trim());
-            }
-            if (rawVal && typeof rawVal === 'object') {
-                queue.push(rawVal);
-            }
-        }
-    }
-    return Array.from(found);
-}
 
 function asRecord(value: unknown) {
     if (!value || typeof value !== 'object') {
@@ -436,19 +314,15 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
         console.error('Teams vote ignored: missing user id', { pollId });
         return;
     }
-    const currentReference = TurnContext.getConversationReference(context.activity);
+    // Preserve the send-time channel reference and card activity id (stored by
+    // /api/send-vote). Do NOT overwrite them with the inbound vote's thread-scoped
+    // reference / replyToId — that is exactly what was breaking the card update.
     if (storedRefKey) {
         await kvSet(`poll:${pollId}:teams_ref_key`, storedRefKey);
     }
-    await kvSet(`poll:${pollId}:teams_ref_inline`, currentReference);
     const userName = typeof context.activity.from?.name === 'string' ? context.activity.from.name.trim() : '';
     if (userName.length > 0) {
         await kvSet(`poll:${pollId}:teams_user_name:${userId}`, userName);
-    }
-    const activityWithFallbackIds = context.activity as unknown as ActivityWithFallbackIds;
-    const targetActivityId = getTargetActivityId(activityWithFallbackIds);
-    if (targetActivityId) {
-        await kvSet(`poll:${pollId}:teams_activity_id`, targetActivityId);
     }
     const voteKey = pollVoteKey(pollId, `teams:${userId}`);
     const voteTsKey = pollVoteTsKey(pollId, `teams:${userId}`);
@@ -462,14 +336,7 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
         await kvSet(voteTsKey, String(Date.now()));
     }
 
-    await updateSlackAndTeams(pollId, meta, {
-        reference: currentReference,
-        activityIds: [
-            ...getTargetActivityIdCandidates(activityWithFallbackIds),
-            ...collectActivityIdsFromValue(context.activity)
-        ],
-        turnContext: context
-    });
+    await updateSlackAndTeams(pollId, meta);
 }
 
 export async function POST(req: Request) {
@@ -481,23 +348,34 @@ export async function POST(req: Request) {
         method: req.method
     };
     const webResponse = new WebApiResponse();
-    await adapter.process(webRequest, webResponse as unknown as BotResponse, async (context) => {
-        const storedRefKey = await storeConversationReference(context);
-        if (context.activity.type === 'invoke') {
-            await context.sendActivity({
-                type: 'invokeResponse',
-                value: { status: 200 }
-            });
-        }
-        try {
-            await handleVote(context, storedRefKey);
-        } catch (error) {
-            console.error('Failed to handle Teams activity', {
-                type: context.activity.type,
-                name: context.activity.name,
-                error
-            });
-        }
-    });
+    try {
+        await adapter.process(webRequest, webResponse as unknown as BotResponse, async (context) => {
+            const storedRefKey = await storeConversationReference(context);
+            if (context.activity.type === 'invoke') {
+                await context.sendActivity({
+                    type: 'invokeResponse',
+                    value: { status: 200 }
+                });
+            }
+            try {
+                await handleVote(context, storedRefKey);
+            } catch (error) {
+                console.error('Failed to handle Teams activity', {
+                    type: context.activity.type,
+                    name: context.activity.name,
+                    error
+                });
+            }
+        });
+    } catch (error) {
+        // adapter.process throws on inbound JWT/auth failure BEFORE the bot logic
+        // callback runs — so votes are never recorded and the card never updates.
+        // Surface it explicitly (otherwise only botbuilder's internal log fires).
+        console.error('Teams adapter.process failed (inbound auth/delivery?)', {
+            hasAuthHeader: Boolean(headers.authorization),
+            activityType: (body as { type?: string })?.type,
+            error
+        });
+    }
     return webResponse.toResponse();
 }
