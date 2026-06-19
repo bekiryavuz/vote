@@ -1,4 +1,4 @@
-import { TurnContext, ConversationReference } from 'botbuilder';
+import { Activity, ConversationReference, TeamsInfo, TurnContext } from 'botbuilder';
 import { kvGetJson, kvListKeys, kvSet } from '@/lib/kv';
 import { buildTeamsCard, PollMeta, PollTally } from '@/lib/poll';
 import { adapter, botAppId } from '@/lib/teamsAdapter';
@@ -115,25 +115,55 @@ export async function storeConversationReference(context: TurnContext) {
 export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, rawReference: unknown) {
     const reference = parseConversationReference(rawReference);
     if (!reference) {
+        console.error('sendTeamsPoll: conversation reference did not parse', {
+            pollId,
+            rawReferenceType: typeof rawReference
+        });
         return null;
     }
+    const conversationId = typeof reference.conversation?.id === 'string' ? reference.conversation.id : '';
+    // The channel id for sendMessageToTeamsChannel is the bare channel id, without any
+    // ;messageid= thread suffix. Derive it from the (real) reference, fall back to env.
+    const teamsChannelId = conversationId.split(';')[0] || TEAMS_CHANNEL_ID;
     let activityId: string | null = null;
+    let createdReference: Partial<ConversationReference> | null = null;
     await adapter.continueConversationAsync(botAppId, reference, async (context) => {
         const card = buildTeamsCard(meta, tally, pollId);
-        const response = await context.sendActivity({
+        // NOTE: deliberately NO top-level `text`. Combining `text` + an adaptive card
+        // in the new-conversation create call makes Teams reject it with
+        // "Activity resulted into multiple skype activities". The card renders the question.
+        const activity = {
             type: 'message',
-            text: meta.question,
             attachments: [
                 {
                     contentType: 'application/vnd.microsoft.card.adaptive',
                     content: card
                 }
             ]
+        } as unknown as Activity;
+        // A plain proactive sendActivity to a Teams channel returns an EMPTY
+        // ResourceResponse ({}), so the card id is never captured and the poll can
+        // never be updated. sendMessageToTeamsChannel posts the message AND returns
+        // both its activity id and a conversation reference usable for updateActivity.
+        const [newReference, newActivityId] = await TeamsInfo.sendMessageToTeamsChannel(
+            context,
+            activity,
+            teamsChannelId,
+            botAppId
+        );
+        createdReference = newReference ?? null;
+        activityId = newActivityId ?? null;
+        console.error('sendTeamsPoll: sendMessageToTeamsChannel result', {
+            pollId,
+            activityId,
+            teamsChannelId,
+            hasReference: Boolean(createdReference)
         });
-        const responseWithActivityId = response as { id?: string; activityId?: string } | undefined;
-        activityId = responseWithActivityId?.id ?? responseWithActivityId?.activityId ?? null;
     });
-    return activityId;
+    if (!activityId) {
+        return null;
+    }
+    return { activityId, reference: createdReference };
 }
 
 export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: PollTally, rawReference: unknown, activityId: string) {
@@ -143,10 +173,11 @@ export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: Pol
     }
     await adapter.continueConversationAsync(botAppId, reference, async (context) => {
         const card = buildTeamsCard(meta, tally, pollId);
+        // Same rule as the send path: no top-level `text` next to the card, or Teams
+        // rejects the update with "Activity resulted into multiple skype activities".
         await context.updateActivity({
             type: 'message',
             id: activityId,
-            text: meta.question,
             attachments: [
                 {
                     contentType: 'application/vnd.microsoft.card.adaptive',

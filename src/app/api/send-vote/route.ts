@@ -63,9 +63,15 @@ export async function POST() {
             } else {
                 await kvSet(`poll:${pollId}:teams_ref_key`, resolved.key);
                 await kvSet(`poll:${pollId}:teams_ref_inline`, resolved.reference);
-                teamsActivityId = await sendTeamsPoll(pollId, meta, tally, resolved.reference);
-                if (teamsActivityId) {
-                    await kvSet(`poll:${pollId}:teams_activity_id`, teamsActivityId);
+                const sent = await sendTeamsPoll(pollId, meta, tally, resolved.reference);
+                if (sent?.activityId) {
+                    teamsActivityId = sent.activityId;
+                    await kvSet(`poll:${pollId}:teams_activity_id`, sent.activityId);
+                    // The message lives in a NEW channel thread; persist that thread's
+                    // reference so updateActivity later targets the right conversation.
+                    if (sent.reference) {
+                        await kvSet(`poll:${pollId}:teams_ref_inline`, sent.reference);
+                    }
                 } else {
                     teamsError = 'Teams activity id missing';
                 }
