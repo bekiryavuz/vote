@@ -153,12 +153,6 @@ export async function sendTeamsPoll(pollId: string, meta: PollMeta, tally: PollT
         );
         createdReference = newReference ?? null;
         activityId = newActivityId ?? null;
-        console.error('sendTeamsPoll: sendMessageToTeamsChannel result', {
-            pollId,
-            activityId,
-            teamsChannelId,
-            hasReference: Boolean(createdReference)
-        });
     });
     if (!activityId) {
         return null;
@@ -171,13 +165,19 @@ export async function updateTeamsPoll(pollId: string, meta: PollMeta, tally: Pol
     if (!reference || !activityId) {
         return;
     }
+    // sendMessageToTeamsChannel returns/stores the conversation form
+    // "19:...@thread.tacv2;messageid=<id>", but updateActivity wants the BARE message id
+    // (the part after messageid=). Passing the full form fails with "Invalid activity ID".
+    const messageActivityId = activityId.includes('messageid=')
+        ? activityId.split('messageid=').pop()!.split(';')[0]
+        : activityId;
     await adapter.continueConversationAsync(botAppId, reference, async (context) => {
         const card = buildTeamsCard(meta, tally, pollId);
         // Same rule as the send path: no top-level `text` next to the card, or Teams
         // rejects the update with "Activity resulted into multiple skype activities".
         await context.updateActivity({
             type: 'message',
-            id: activityId,
+            id: messageActivityId,
             attachments: [
                 {
                     contentType: 'application/vnd.microsoft.card.adaptive',

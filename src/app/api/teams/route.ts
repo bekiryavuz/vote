@@ -1,9 +1,10 @@
-import { TurnContext } from 'botbuilder';
+import { TeamsInfo, TurnContext } from 'botbuilder';
 import type { Request as BotRequest, Response as BotResponse } from 'botbuilder';
 import { buildPollTally, buildSlackBlocks, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
-import { kvDelete, kvGetJson, kvGetRaw, kvListKeys, kvSet } from '@/lib/kv';
+import { kvDelete, kvGetJson, kvGetRaw, kvSet } from '@/lib/kv';
 import { getTeamsConversationReference, storeConversationReference, teamsBotConfigReady, updateTeamsPoll } from '@/lib/teams';
 import { adapter } from '@/lib/teamsAdapter';
+import { listVotes, pollVoteKey, pollVoteTsKey } from '@/lib/votes';
 
 export const runtime = 'nodejs';
 
@@ -48,23 +49,6 @@ class WebApiResponse {
     }
 }
 
-function pollVoteKey(pollId: string, voterKey: string) {
-    return `poll:${pollId}:vote:${voterKey}`;
-}
-
-function pollVoteTsKey(pollId: string, voterKey: string) {
-    return `poll:${pollId}:vote_ts:${voterKey}`;
-}
-
-function normalizeIdentity(value: string) {
-    return value
-        .trim()
-        .toLowerCase()
-        .normalize('NFKD')
-        .replace(/\p{M}+/gu, '')
-        .replace(/[^\p{L}\p{N}]+/gu, '');
-}
-
 async function getPollMeta(pollId: string): Promise<PollMeta | null> {
     const raw = await kvGetJson<unknown>(`poll:${pollId}:meta`);
     return normalizeLegacyMeta(raw);
@@ -80,50 +64,6 @@ async function getTeamsReferenceForPoll(pollId: string) {
         return kvGetJson(teamsRefKey);
     }
     return getTeamsConversationReference();
-}
-
-async function listVotes(pollId: string) {
-    const keys = await kvListKeys(`poll:${pollId}:vote:*`);
-    const deduped = new Map<string, { voter?: string; optionIdx: number; updatedAt: number }>();
-    const prefix = `poll:${pollId}:vote:`;
-    for (const key of keys) {
-        const raw = await kvGetRaw(key);
-        const idx = parseInt(String(raw), 10);
-        if (Number.isNaN(idx)) {
-            continue;
-        }
-        const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
-        const tsRaw = await kvGetRaw(pollVoteTsKey(pollId, voterKey));
-        const updatedAt = parseInt(String(tsRaw), 10);
-        const ts = Number.isNaN(updatedAt) ? 0 : updatedAt;
-        let voter: string | undefined;
-        let identityKey: string;
-        if (voterKey.startsWith('teams:')) {
-            const teamsUserId = voterKey.replace('teams:', '');
-            const teamsNameRaw = await kvGetRaw(`poll:${pollId}:teams_user_name:${teamsUserId}`);
-            const teamsName = typeof teamsNameRaw === 'string' && teamsNameRaw.trim().length > 0
-                ? teamsNameRaw.trim()
-                : teamsUserId;
-            voter = `teams:${teamsName}`;
-            identityKey = `name:${normalizeIdentity(teamsName)}`;
-        } else if (voterKey.startsWith('slack:')) {
-            voter = voterKey;
-            const slackUserId = voterKey.replace('slack:', '');
-            const slackNameRaw = await kvGetRaw(`poll:${pollId}:slack_user_name:${slackUserId}`);
-            const slackName = typeof slackNameRaw === 'string' && slackNameRaw.trim().length > 0
-                ? slackNameRaw.trim()
-                : '';
-            identityKey = slackName ? `name:${normalizeIdentity(slackName)}` : `slack:${slackUserId}`;
-        } else {
-            voter = voterKey;
-            identityKey = `raw:${voterKey}`;
-        }
-        const existing = deduped.get(identityKey);
-        if (!existing || ts >= existing.updatedAt) {
-            deduped.set(identityKey, { voter, optionIdx: idx, updatedAt: ts });
-        }
-    }
-    return Array.from(deduped.values()).map(({ voter, optionIdx }) => ({ voter, optionIdx }));
 }
 
 async function updateSlackAndTeams(pollId: string, meta: PollMeta) {
@@ -323,6 +263,18 @@ async function handleVote(context: TurnContext, storedRefKey: string | null) {
     const userName = typeof context.activity.from?.name === 'string' ? context.activity.from.name.trim() : '';
     if (userName.length > 0) {
         await kvSet(`poll:${pollId}:teams_user_name:${userId}`, userName);
+    }
+    // Best-effort email so the same person is de-duplicated across Slack + Teams even when
+    // display names differ. Falls back to name-based dedup if the roster lookup fails.
+    try {
+        const member = await TeamsInfo.getMember(context, from?.id || userId);
+        const memberRecord = member as { email?: string; userPrincipalName?: string } | undefined;
+        const email = memberRecord?.email || memberRecord?.userPrincipalName || '';
+        if (email) {
+            await kvSet(`poll:${pollId}:teams_user_email:${userId}`, email);
+        }
+    } catch (error) {
+        console.error('Teams getMember failed (email dedup will fall back to name)', { pollId, error });
     }
     const voteKey = pollVoteKey(pollId, `teams:${userId}`);
     const voteTsKey = pollVoteTsKey(pollId, `teams:${userId}`);

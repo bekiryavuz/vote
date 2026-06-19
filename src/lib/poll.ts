@@ -9,9 +9,11 @@ export type PollMeta = {
     creator: string;
 };
 
+export type PollVoter = { ref: string; name: string };
+
 export type PollTally = {
     counts: number[];
-    voters: string[][];
+    voters: PollVoter[][];
     totalVotes: number;
 };
 
@@ -32,24 +34,26 @@ function toTeamsEmoji(emojiCode: string) {
     return normalized;
 }
 
-function formatSlackVoter(voter: string) {
-    if (voter.startsWith('slack:')) {
-        return `<@${voter.replace('slack:', '')}>`;
+function formatSlackVoter(voter: PollVoter) {
+    if (voter.ref.startsWith('slack:')) {
+        return `<@${voter.ref.slice('slack:'.length)}>`;
     }
-    if (voter.startsWith('teams:')) {
-        return `Teams:${voter.replace('teams:', '')}`;
-    }
-    return `<@${voter}>`;
+    // A Teams voter cannot be @-mentioned from Slack — show their display name.
+    return voter.name || voter.ref;
 }
 
-export function buildPollTally(optionsCount: number, votes: Array<{ voter?: string; optionIdx: number }>): PollTally {
+function formatTeamsVoter(voter: PollVoter) {
+    return voter.name || voter.ref;
+}
+
+export function buildPollTally(optionsCount: number, votes: Array<{ ref?: string; name?: string; optionIdx: number }>): PollTally {
     const counts = Array(optionsCount).fill(0);
-    const voters: string[][] = Array.from({ length: optionsCount }, () => []);
+    const voters: PollVoter[][] = Array.from({ length: optionsCount }, () => []);
     for (const vote of votes) {
         if (vote.optionIdx >= 0 && vote.optionIdx < optionsCount) {
             counts[vote.optionIdx] += 1;
-            if (vote.voter) {
-                voters[vote.optionIdx].push(vote.voter);
+            if (vote.ref || vote.name) {
+                voters[vote.optionIdx].push({ ref: vote.ref ?? '', name: vote.name ?? '' });
             }
         }
     }
@@ -111,9 +115,11 @@ export function buildTeamsCard(meta: PollMeta, tally: PollTally, pollId: string)
             const percent = tally.totalVotes === 0 ? 0 : Math.round((tally.counts[i] / tally.totalVotes) * 100);
             const bar = renderBar(percent, tally.counts[i]);
             const emoji = toTeamsEmoji(opt.emoji);
+            const voters = tally.voters[i].map((voter) => formatTeamsVoter(voter)).filter(Boolean).join(', ');
             return [
                 { type: 'TextBlock', text: `${i + 1}. ${opt.label} ${emoji}`, wrap: true, spacing: 'Small' },
-                { type: 'TextBlock', text: `${bar}`, wrap: true, spacing: 'None' }
+                { type: 'TextBlock', text: `${bar}`, wrap: true, spacing: 'None' },
+                { type: 'TextBlock', text: voters || '_No votes_', wrap: true, spacing: 'None', size: 'Small', isSubtle: true }
             ];
         }),
         { type: 'TextBlock', text: `Responses: ${tally.totalVotes}`, wrap: true, spacing: 'Medium' }

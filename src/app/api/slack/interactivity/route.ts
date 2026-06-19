@@ -1,30 +1,30 @@
 import { NextRequest } from 'next/server';
 import { randomUUID } from 'node:crypto';
 import { buildPollTally, buildSlackBlocks, normalizeLegacyMeta, PollMeta } from '@/lib/poll';
-import { kvDelete, kvGetJson, kvGetRaw, kvListKeys, kvSet } from '@/lib/kv';
+import { kvDelete, kvGetJson, kvGetRaw, kvSet } from '@/lib/kv';
 import { getTeamsConversationReference, updateTeamsPoll, teamsBotConfigReady } from '@/lib/teams';
+import { listVotes, pollVoteKey, pollVoteTsKey, slackVoterKey } from '@/lib/votes';
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
 
-function pollVoteKey(pollId: string, voterKey: string) {
-    return `poll:${pollId}:vote:${voterKey}`;
-}
-
-function pollVoteTsKey(pollId: string, voterKey: string) {
-    return `poll:${pollId}:vote_ts:${voterKey}`;
-}
-
-function slackVoterKey(userId: string) {
-    return `slack:${userId}`;
-}
-
-function normalizeIdentity(value: string) {
-    return value
-        .trim()
-        .toLowerCase()
-        .normalize('NFKD')
-        .replace(/\p{M}+/gu, '')
-        .replace(/[^\p{L}\p{N}]+/gu, '');
+// Best-effort: resolve the Slack user's real name + email so the same person can be
+// de-duplicated against their Teams vote, and shown by name on the Teams card.
+async function getSlackProfile(userId: string): Promise<{ name: string; email: string }> {
+    try {
+        const res = await fetch(`https://slack.com/api/users.info?user=${userId}`, {
+            headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` }
+        });
+        const data = await res.json();
+        if (data.ok) {
+            const profile = data.user?.profile ?? {};
+            const name = profile.real_name || data.user?.real_name || profile.display_name || '';
+            const email = profile.email || '';
+            return { name, email };
+        }
+    } catch {
+        // Ignore — caller falls back to the payload-provided handle.
+    }
+    return { name: '', email: '' };
 }
 
 async function getPollIdBySlackTs(ts: string) {
@@ -52,50 +52,6 @@ async function getTeamsReferenceForPoll(pollId: string) {
         return kvGetJson(teamsRefKey);
     }
     return getTeamsConversationReference();
-}
-
-async function listVotes(pollId: string) {
-    const keys = await kvListKeys(`poll:${pollId}:vote:*`);
-    const deduped = new Map<string, { voter?: string; optionIdx: number; updatedAt: number }>();
-    const prefix = `poll:${pollId}:vote:`;
-    for (const key of keys) {
-        const raw = await kvGetRaw(key);
-        const idx = parseInt(String(raw), 10);
-        if (Number.isNaN(idx)) {
-            continue;
-        }
-        const voterKey = key.startsWith(prefix) ? key.slice(prefix.length) : key;
-        const tsRaw = await kvGetRaw(pollVoteTsKey(pollId, voterKey));
-        const updatedAt = parseInt(String(tsRaw), 10);
-        const ts = Number.isNaN(updatedAt) ? 0 : updatedAt;
-        let voter: string | undefined;
-        let identityKey: string;
-        if (voterKey.startsWith('teams:')) {
-            const teamsUserId = voterKey.replace('teams:', '');
-            const teamsNameRaw = await kvGetRaw(`poll:${pollId}:teams_user_name:${teamsUserId}`);
-            const teamsName = typeof teamsNameRaw === 'string' && teamsNameRaw.trim().length > 0
-                ? teamsNameRaw.trim()
-                : teamsUserId;
-            voter = `teams:${teamsName}`;
-            identityKey = `name:${normalizeIdentity(teamsName)}`;
-        } else if (voterKey.startsWith('slack:')) {
-            voter = voterKey;
-            const slackUserId = voterKey.replace('slack:', '');
-            const slackNameRaw = await kvGetRaw(`poll:${pollId}:slack_user_name:${slackUserId}`);
-            const slackName = typeof slackNameRaw === 'string' && slackNameRaw.trim().length > 0
-                ? slackNameRaw.trim()
-                : '';
-            identityKey = slackName ? `name:${normalizeIdentity(slackName)}` : `slack:${slackUserId}`;
-        } else {
-            voter = voterKey;
-            identityKey = `raw:${voterKey}`;
-        }
-        const existing = deduped.get(identityKey);
-        if (!existing || ts >= existing.updatedAt) {
-            deduped.set(identityKey, { voter, optionIdx: idx, updatedAt: ts });
-        }
-    }
-    return Array.from(deduped.values()).map(({ voter, optionIdx }) => ({ voter, optionIdx }));
 }
 
 async function updateSlackAndTeams(pollId: string, meta: PollMeta, slackChannelId: string, slackTs: string) {
@@ -227,9 +183,13 @@ export async function POST(req: NextRequest) {
                     await kvDelete(legacyKey);
                     await kvDelete(legacyTsKey);
                 }
+                const profile = await getSlackProfile(userId);
                 await kvSet(prefixedKey, String(optionIdx));
                 await kvSet(prefixedTsKey, String(Date.now()));
-                await kvSet(`poll:${pollId}:slack_user_name:${userId}`, String(slackName));
+                await kvSet(`poll:${pollId}:slack_user_name:${userId}`, profile.name || String(slackName));
+                if (profile.email) {
+                    await kvSet(`poll:${pollId}:slack_user_email:${userId}`, profile.email);
+                }
             }
 
             const slackTs = (await getSlackTsForPoll(pollId)) || ts;
