@@ -1,8 +1,13 @@
-const KV_REST_API_URL = process.env.KV_REST_API_URL!;
-const KV_REST_API_TOKEN = process.env.KV_REST_API_TOKEN!;
+import { config } from '@/infrastructure/config';
+
+// Raw Upstash / Vercel KV REST transport. The only module that speaks HTTP to KV.
 
 function buildKvUrl(path: string) {
-    return `${KV_REST_API_URL.replace(/\/$/, '')}/${path}`;
+    return `${config.kv.url.replace(/\/$/, '')}/${path}`;
+}
+
+function authHeader() {
+    return { Authorization: `Bearer ${config.kv.token}` };
 }
 
 async function parseKvText(text: string) {
@@ -18,9 +23,7 @@ async function parseKvText(text: string) {
 }
 
 export async function kvGetRaw(key: string) {
-    const res = await fetch(buildKvUrl(`get/${key}`), {
-        headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` }
-    });
+    const res = await fetch(buildKvUrl(`get/${key}`), { headers: authHeader() });
     const text = await res.text();
     if (!res.ok) {
         return null;
@@ -47,7 +50,7 @@ export async function kvSet(key: string, value: unknown) {
     const body = typeof value === 'string' ? value : JSON.stringify(value);
     const res = await fetch(buildKvUrl(`set/${key}`), {
         method: 'POST',
-        headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` },
+        headers: authHeader(),
         body
     });
     return res.ok;
@@ -56,15 +59,13 @@ export async function kvSet(key: string, value: unknown) {
 export async function kvDelete(key: string) {
     const res = await fetch(buildKvUrl(`del/${key}`), {
         method: 'POST',
-        headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` }
+        headers: authHeader()
     });
     return res.ok;
 }
 
 export async function kvListKeys(pattern: string): Promise<string[]> {
-    const res = await fetch(buildKvUrl(`keys/${pattern}`), {
-        headers: { Authorization: `Bearer ${KV_REST_API_TOKEN}` }
-    });
+    const res = await fetch(buildKvUrl(`keys/${pattern}`), { headers: authHeader() });
     if (!res.ok) {
         return [];
     }
