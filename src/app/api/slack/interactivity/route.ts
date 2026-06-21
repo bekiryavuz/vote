@@ -21,8 +21,11 @@ async function getSlackProfile(userId: string): Promise<{ name: string; email: s
             const email = profile.email || '';
             return { name, email };
         }
-    } catch {
-        // Ignore — caller falls back to the payload-provided handle.
+        // Most commonly error === 'missing_scope': add users:read (+ users:read.email)
+        // to the Slack app's bot token scopes so real names / emails resolve.
+        console.error('Slack users.info failed; falling back to handle', { error: data?.error });
+    } catch (error) {
+        console.error('Slack users.info threw', { userId, error });
     }
     return { name: '', email: '' };
 }
