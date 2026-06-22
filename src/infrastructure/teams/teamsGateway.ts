@@ -42,9 +42,10 @@ export function createTeamsGateway(repo: PollRepository): TeamsGateway {
                 return null;
             }
             const conversationId = typeof reference.conversation?.id === 'string' ? reference.conversation.id : '';
-            // The channel id for sendMessageToTeamsChannel is the bare channel id, without any
-            // ;messageid= thread suffix. Derive it from the (real) reference, fall back to env.
-            const teamsChannelId = conversationId.split(';')[0] || config.teams.channelId;
+            // Post to the EXPLICIT target channel (env). The reference only establishes the
+            // connector / serviceUrl; its conversation.id can be the team's General channel
+            // rather than our target channel, so config.teams.channelId takes precedence.
+            const teamsChannelId = config.teams.channelId || conversationId.split(';')[0];
             let activityId: string | null = null;
             let createdReference: Partial<ConversationReference> | null = null;
             await adapter.continueConversationAsync(botAppId, reference, async (context) => {
