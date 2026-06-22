@@ -1,5 +1,5 @@
-import { decideVote } from '@/domain/tally';
 import { slackVoterKey } from '@/domain/identity';
+import { reconcileVote } from '@/application/reconcileVote';
 import type { PollRepository, SlackGateway } from '@/application/ports';
 import type { SyncPoll } from '@/application/syncPoll';
 
@@ -20,15 +20,12 @@ export function makeRecordSlackVote(repo: PollRepository, slack: SlackGateway, s
             return;
         }
 
-        const voterKey = slackVoterKey(input.userId);
-        const decision = decideVote(await repo.getVote(pollId, voterKey), input.optionIdx);
-        if (decision.action === 'clear') {
-            await repo.clearVote(pollId, voterKey);
-        } else {
-            const profile = await slack.getProfile(input.userId);
-            await repo.setVote(pollId, voterKey, decision.optionIdx);
-            await repo.saveSlackVoter(pollId, input.userId, profile.name || input.slackHandle, profile.email || undefined);
-        }
+        // Resolve identity up front (also on un-vote) so the vote can be reconciled against
+        // the same person's Teams vote.
+        const profile = await slack.getProfile(input.userId);
+        const person = { name: profile.name || input.slackHandle, email: profile.email };
+        await repo.saveSlackVoter(pollId, input.userId, person.name, person.email || undefined);
+        await reconcileVote(repo, pollId, slackVoterKey(input.userId), person, input.optionIdx);
 
         await syncPoll(pollId, meta, { channelId: input.channelId, ts: input.ts });
     };

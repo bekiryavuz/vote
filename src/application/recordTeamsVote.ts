@@ -1,6 +1,6 @@
 import type { TurnContext } from 'botbuilder';
-import { decideVote } from '@/domain/tally';
 import { teamsVoterKey } from '@/domain/identity';
+import { reconcileVote } from '@/application/reconcileVote';
 import type { PollRepository, TeamsGateway } from '@/application/ports';
 import type { SyncPoll } from '@/application/syncPoll';
 
@@ -146,13 +146,8 @@ export function makeRecordTeamsVote(repo: PollRepository, teams: TeamsGateway, s
         const email = await teams.getMemberEmail(context, from?.id || userId);
         await repo.saveTeamsVoter(pollId, userId, userName, email || undefined);
 
-        const voterKey = teamsVoterKey(userId);
-        const decision = decideVote(await repo.getVote(pollId, voterKey), optionIdx);
-        if (decision.action === 'clear') {
-            await repo.clearVote(pollId, voterKey);
-        } else {
-            await repo.setVote(pollId, voterKey, decision.optionIdx);
-        }
+        const person = { name: userName || userId, email };
+        await reconcileVote(repo, pollId, teamsVoterKey(userId), person, optionIdx);
 
         await syncPoll(pollId, meta);
     };
